@@ -2,11 +2,15 @@
 name = "agent-harness-rs"
 version = "0.1.0"
 edition = "2021"
+authors = ["yifanes"]
 license = "MIT"
 description = "Agent loop harness with local and sandbox tool runtimes, context management, and MCP support"
-repository = "https://github.com/yourusername/agent-harness-rs"
+repository = "https://github.com/firsthave/agent-harness-rs"
+homepage = "https://github.com/firsthave/agent-harness-rs"
+documentation = "https://docs.rs/agent-harness-rs"
 keywords = ["agent", "llm", "tool-calling", "mcp", "e2b"]
 categories = ["asynchronous", "api-bindings"]
+readme = "README.md"
 
 [lib]
 name = "harness"   # import as: use harness::...
