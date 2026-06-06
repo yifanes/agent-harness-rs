@@ -1,0 +1,39 @@
+[package]
+name = "agent-harness-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Agent loop harness with local and sandbox tool runtimes, context management, and MCP support"
+repository = "https://github.com/yourusername/agent-harness-rs"
+keywords = ["agent", "llm", "tool-calling", "mcp", "sandbox"]
+categories = ["asynchronous", "api-bindings"]
+
+[lib]
+name = "harness"   # import as: use harness::...
+
+[dependencies]
+async-trait        = "0.1"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+thiserror          = "2"
+tokio              = { version = "1", features = ["full"] }
+tokio-stream       = "0.1"
+tokio-util         = { version = "0.7", features = ["rt"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures            = "0.3"
+eventsource-stream = "0.2"
+tracing            = "0.1"
+uuid               = { version = "1", features = ["v4"] }
+base64             = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[features]
+default = ["local-tools"]
+
+# Local filesystem + bash tool runtime (bash/read/write/edit/glob/grep)
+local-tools = []
+
+# E2b sandbox tool runtime — calls e2b HTTP API via reqwest (already a dep)
+e2b = []

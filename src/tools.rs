@@ -1,0 +1,1093 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+/// LLM-facing description of one tool. `input_schema` is a JSON Schema
+/// object the model uses to generate well-formed `tool_call.arguments`.
+/// Shared between providers — OpenAI wraps it in `{type:"function", function:{...}}`,
+/// future Anthropic client will pass it as Messages API `input_schema` verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for `tool_call.arguments`. Must be an `object`-typed schema.
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolInvocation {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutcome {
+    pub output: Result<Value, ToolFailure>,
+    /// Structured non-text attachments returned by the tool — currently
+    /// just images returned by MCP servers (e.g. a screenshot tool).
+    /// Empty Vec for native tools (`SandboxToolRuntime`) — none of them
+    /// produce non-text output today. Reuses `UserAttachment` rather
+    /// than introducing a parallel `ToolAttachment` enum because both
+    /// shapes are identical (image source); rename to `MediaAttachment`
+    /// if a future tool variant differs.
+    pub attachments: Vec<crate::model::UserAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolFailureKind {
+    InvalidInput,
+    NotFound,
+    NonZeroExit,
+    Timeout,
+    Runtime,
+    /// Rejected by policy before dispatch (e.g. a shell command on the
+    /// hard-deny list). The message tells the model why so it can adjust.
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFailure {
+    pub kind: ToolFailureKind,
+    pub message: String,
+}
+
+impl ToolFailure {
+    pub fn new(kind: ToolFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolRuntimeError {
+    #[error("unknown tool {0}")]
+    UnknownTool(String),
+
+    #[error("invalid input for {tool}: {message}")]
+    InvalidInput { tool: String, message: String },
+
+    #[error("tool timed out: {0}")]
+    Timeout(String),
+
+    #[error("tool runtime failed: {0}")]
+    Runtime(String),
+}
+
+#[async_trait]
+pub trait ToolRuntime: Send + Sync {
+    fn specs(&self) -> Vec<ToolSpec>;
+
+    async fn invoke(&self, invocation: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError>;
+
+    /// Cancellation-aware variant of `invoke`. When `cancel` is fired
+    /// the runtime SHOULD abort the in-flight tool (e.g. SIGTERM the
+    /// shell subprocess for `bash`) and return `ToolRuntimeError::
+    /// Runtime("cancelled")`.
+    ///
+    /// Default impl ignores the cancel handle and delegates to
+    /// `invoke` — agent_loop layers a `tokio::select!` on top so the
+    /// outer future is dropped on cancel even when the inner runtime
+    /// can't propagate. The cost is a leaked tool-side process until
+    /// it exits naturally; runtimes whose tools can take minutes
+    /// (shells, network tools) should override this to forward the
+    /// signal.
+    async fn invoke_cancellable(
+        &self,
+        invocation: ToolInvocation,
+        _cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<ToolOutcome, ToolRuntimeError> {
+        self.invoke(invocation).await
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MockToolRuntime {
+    files: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl MockToolRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_file(self, path: impl Into<String>, content: impl Into<String>) -> Self {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.into(), content.into());
+        self
+    }
+}
+
+#[async_trait]
+impl ToolRuntime for MockToolRuntime {
+    fn specs(&self) -> Vec<ToolSpec> {
+        builtin_tool_specs()
+    }
+
+    async fn invoke(&self, invocation: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError> {
+        match invocation.name.as_str() {
+            "bash" => {
+                let command = required_str(&invocation, "command")?;
+                Ok(ToolOutcome {
+                    output: Ok(json!({
+                        "command": command,
+                        "stdout": format!("mock executed: {command}\n"),
+                        "stderr": "",
+                        "exit_code": 0,
+                    })),
+                    attachments: vec![],
+                })
+            }
+            "read" => {
+                let path = required_str(&invocation, "path")?;
+                let files = self.files.lock().unwrap();
+                match files.get(path) {
+                    Some(content) => Ok(ToolOutcome {
+                        output: Ok(json!({"path": path, "content": content})),
+                        attachments: vec![],
+                    }),
+                    None => Ok(ToolOutcome {
+                        output: Err(ToolFailure::new(
+                            ToolFailureKind::NotFound,
+                            format!("file not found: {path}"),
+                        )),
+                        attachments: vec![],
+                    }),
+                }
+            }
+            "write" => {
+                let path = required_str(&invocation, "path")?.to_string();
+                let content = required_str(&invocation, "content")?.to_string();
+                self.files.lock().unwrap().insert(path.clone(), content);
+                Ok(ToolOutcome {
+                    output: Ok(json!({"path": path, "written": true})),
+                    attachments: vec![],
+                })
+            }
+            "edit" => {
+                let path = required_str(&invocation, "path")?.to_string();
+                let old_string = required_str(&invocation, "old_string")?.to_string();
+                let new_string = invocation
+                    .input
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let replace_all = invocation
+                    .input
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut files = self.files.lock().unwrap();
+                let Some(content) = files.get(&path).cloned() else {
+                    return Ok(ToolOutcome {
+                        output: Err(ToolFailure::new(
+                            ToolFailureKind::NotFound,
+                            format!("file not found: {path}"),
+                        )),
+                        attachments: vec![],
+                    });
+                };
+                let resolved = match resolve_edit_search(
+                    &content,
+                    &old_string,
+                    &new_string,
+                    replace_all,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let message = match e {
+                            EditSearchError::NotFound => {
+                                format!("old_string not found in {path}")
+                            }
+                            EditSearchError::EscapedNotFound => format!(
+                                "old_string not found in {path}; old_string appears JSON-escaped, but the unescaped text was also not found"
+                            ),
+                            EditSearchError::Ambiguous { occurrences } => format!(
+                                "old_string matches {occurrences} occurrences; pass replace_all=true or supply a unique substring"
+                            ),
+                            EditSearchError::EscapedAmbiguous { occurrences } => format!(
+                                "old_string not found in {path}; old_string appears JSON-escaped, but the unescaped text matches {occurrences} occurrences; pass replace_all=true or supply a unique substring"
+                            ),
+                        };
+                        return Ok(ToolOutcome {
+                            output: Err(ToolFailure::new(ToolFailureKind::InvalidInput, message)),
+                            attachments: vec![],
+                        });
+                    }
+                };
+                let next = if replace_all {
+                    content.replace(&resolved.old_string, &resolved.new_string)
+                } else {
+                    content.replacen(&resolved.old_string, &resolved.new_string, 1)
+                };
+                let replaced = if replace_all { resolved.occurrences } else { 1 };
+                files.insert(path.clone(), next);
+                let mut result = json!({"path": path, "replaced": replaced});
+                if let Some(repair) = resolved.repair {
+                    // Surface the repair to the model so it learns the
+                    // arguments were literal-escaped.
+                    result["repair"] = json!(repair);
+                }
+                Ok(ToolOutcome {
+                    output: Ok(result),
+                    attachments: vec![],
+                })
+            }
+            "grep" => {
+                let pattern = required_str(&invocation, "pattern")?.to_string();
+                let case_insensitive = invocation
+                    .input
+                    .get("case_insensitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let needle = if case_insensitive {
+                    pattern.to_lowercase()
+                } else {
+                    pattern.clone()
+                };
+                let files = self.files.lock().unwrap();
+                let mut matches = Vec::new();
+                for (path, content) in files.iter() {
+                    for (idx, line) in content.lines().enumerate() {
+                        let hay = if case_insensitive {
+                            line.to_lowercase()
+                        } else {
+                            line.to_string()
+                        };
+                        if hay.contains(&needle) {
+                            matches.push(json!({
+                                "path": path,
+                                "line": idx + 1,
+                                "text": line,
+                            }));
+                        }
+                    }
+                }
+                Ok(ToolOutcome {
+                    output: Ok(json!({"pattern": pattern, "matches": matches})),
+                    attachments: vec![],
+                })
+            }
+            "glob" => {
+                let pattern = required_str(&invocation, "pattern")?.to_string();
+                let files = self.files.lock().unwrap();
+                let matches: Vec<&str> = files
+                    .keys()
+                    .filter(|k| simple_glob_match(&pattern, k))
+                    .map(|k| k.as_str())
+                    .collect();
+                Ok(ToolOutcome {
+                    output: Ok(json!({"pattern": pattern, "matches": matches})),
+                    attachments: vec![],
+                })
+            }
+            other => Err(ToolRuntimeError::UnknownTool(other.into())),
+        }
+    }
+}
+
+/// Successful resolution of an edit's search/replace strings against file
+/// content. `repair` is `Some("json_escape_unwrapped")` when the match
+/// only succeeded after unescaping literal `\n` / `\t` / `\r` sequences —
+/// weak models frequently double-escape control characters when emitting
+/// `old_string` through JSON tool arguments.
+#[derive(Debug)]
+pub struct ResolvedEditSearch {
+    pub old_string: String,
+    pub new_string: String,
+    pub occurrences: usize,
+    pub repair: Option<&'static str>,
+}
+
+/// Why an edit search failed to resolve. Callers build the user-facing
+/// message (each runtime embeds the path differently).
+#[derive(Debug, PartialEq)]
+pub enum EditSearchError {
+    /// `old_string` not in content, no escape rescue applicable.
+    NotFound,
+    /// `old_string` looked JSON-escaped, but the unescaped text is not in
+    /// the content either.
+    EscapedNotFound,
+    /// Direct match is ambiguous without `replace_all`.
+    Ambiguous { occurrences: usize },
+    /// Unescaped match is ambiguous without `replace_all`.
+    EscapedAmbiguous { occurrences: usize },
+}
+
+/// Resolve `old_string` against `content`, falling back to unescaping
+/// literal control sequences when the strict match fails. The direct
+/// match keeps our existing ambiguity guard; the escape fallback mirrors
+/// unescape both old and new strings, require a match, and reject
+/// multi-location matches without `replace_all`.
+pub fn resolve_edit_search(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<ResolvedEditSearch, EditSearchError> {
+    let direct = content.matches(old_string).count();
+    if direct > 0 {
+        if !replace_all && direct > 1 {
+            return Err(EditSearchError::Ambiguous {
+                occurrences: direct,
+            });
+        }
+        return Ok(ResolvedEditSearch {
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            occurrences: direct,
+            repair: None,
+        });
+    }
+    if !has_literal_escaped_controls(old_string) {
+        return Err(EditSearchError::NotFound);
+    }
+    let unescaped_old = unescape_literal_controls(old_string);
+    if unescaped_old == old_string {
+        return Err(EditSearchError::NotFound);
+    }
+    let count = content.matches(&unescaped_old).count();
+    if count == 0 {
+        return Err(EditSearchError::EscapedNotFound);
+    }
+    if !replace_all && count > 1 {
+        return Err(EditSearchError::EscapedAmbiguous { occurrences: count });
+    }
+    Ok(ResolvedEditSearch {
+        old_string: unescaped_old,
+        new_string: unescape_literal_controls(new_string),
+        occurrences: count,
+        repair: Some("json_escape_unwrapped"),
+    })
+}
+
+/// Does the string contain literal (two-character) `\n` / `\t` / `\r`
+/// escape sequences?
+fn has_literal_escaped_controls(s: &str) -> bool {
+    s.contains("\\n") || s.contains("\\t") || s.contains("\\r")
+}
+
+/// Replace literal escape sequences with their control characters:
+/// `\r\n` → newline (checked first), then
+/// `\n` → newline, `\r` → CR, `\t` → tab. Anything else passes through —
+/// including `\\` — so `\\n` becomes `\` + newline, matching Go.
+fn unescape_literal_controls(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'r'
+                && i + 3 < bytes.len()
+                && bytes[i + 2] == b'\\'
+                && bytes[i + 3] == b'n'
+            {
+                out.push(b'\n');
+                i += 4;
+                continue;
+            }
+            let replacement = match bytes[i + 1] {
+                b'n' => Some(b'\n'),
+                b'r' => Some(b'\r'),
+                b't' => Some(b'\t'),
+                _ => None,
+            };
+            if let Some(ch) = replacement {
+                out.push(ch);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Only ASCII subsequences were replaced; multi-byte UTF-8 passes
+    // through verbatim, so the result is valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Glob-match a pattern against a relative path string.
+/// Supports `*` (any chars except `/`), `**` (any chars including `/`), `?`,
+/// and `{a,b}` brace alternation (models emit `**/*.{ts,tsx}` reflexively —
+/// silently treating `{` as a literal made such patterns match nothing).
+/// Used by `MockToolRuntime` and by `fs_glob` for real-filesystem walks.
+pub fn simple_glob_match(pattern: &str, candidate: &str) -> bool {
+    if pattern.contains('{') {
+        // expand_braces returns fully-expanded patterns (no `{` groups left
+        // except literal unbalanced ones), so match each directly.
+        return expand_braces(pattern)
+            .iter()
+            .any(|p| simple_glob_match_single(p, candidate));
+    }
+    simple_glob_match_single(pattern, candidate)
+}
+
+/// Cap on patterns produced by brace expansion — a backstop against
+/// pathological nesting like `{a,b}{c,d}{e,f}…` multiplying without bound.
+const MAX_BRACE_EXPANSIONS: usize = 128;
+
+/// Expand the first balanced `{a,b,…}` group into one pattern per
+/// alternative, recursing so nested groups and multiple groups multiply
+/// out. A pattern without braces (or with an unbalanced `{`, kept as a
+/// literal) returns itself. Output is capped at [`MAX_BRACE_EXPANSIONS`].
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let Some(open) = chars.iter().position(|&c| c == '{') else {
+        return vec![pattern.to_string()];
+    };
+    // Find the matching close brace, tracking nesting depth.
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return vec![pattern.to_string()]; // unbalanced → literal `{`
+    };
+    let prefix: String = chars[..open].iter().collect();
+    let suffix: String = chars[close + 1..].iter().collect();
+    // Split alternatives on top-level commas only (commas inside nested
+    // groups belong to the inner group).
+    let mut alts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut d = 0usize;
+    for &c in &chars[open + 1..close] {
+        match c {
+            '{' => {
+                d += 1;
+                cur.push(c);
+            }
+            '}' => {
+                d -= 1;
+                cur.push(c);
+            }
+            ',' if d == 0 => alts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    alts.push(cur);
+    let mut out = Vec::new();
+    for alt in alts {
+        for expanded in expand_braces(&format!("{prefix}{alt}{suffix}")) {
+            out.push(expanded);
+            if out.len() >= MAX_BRACE_EXPANSIONS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn simple_glob_match_single(pattern: &str, candidate: &str) -> bool {
+    // Translate the glob to a regex-lite pattern by walking byte-by-byte.
+    // `**` matches anything (including separators); `*` matches any chars
+    // except `/`; `?` matches a single non-`/` char; everything else is
+    // literal. Keep it simple: O(N*M) recursive descent.
+    let pat: Vec<char> = pattern.chars().collect();
+    let cand: Vec<char> = candidate.chars().collect();
+    fn walk(pat: &[char], cand: &[char]) -> bool {
+        let mut p = 0usize;
+        let mut c = 0usize;
+        while p < pat.len() {
+            match pat[p] {
+                '*' if pat.get(p + 1) == Some(&'*') => {
+                    let rest = &pat[p + 2..];
+                    for end in c..=cand.len() {
+                        if walk(rest, &cand[end..]) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                '*' => {
+                    let rest = &pat[p + 1..];
+                    while c <= cand.len() {
+                        if walk(rest, &cand[c..]) {
+                            return true;
+                        }
+                        if c == cand.len() || cand[c] == '/' {
+                            return false;
+                        }
+                        c += 1;
+                    }
+                    return false;
+                }
+                '?' => {
+                    if c >= cand.len() || cand[c] == '/' {
+                        return false;
+                    }
+                    c += 1;
+                    p += 1;
+                }
+                ch => {
+                    if c >= cand.len() || cand[c] != ch {
+                        return false;
+                    }
+                    c += 1;
+                    p += 1;
+                }
+            }
+        }
+        c == cand.len()
+    }
+    walk(&pat, &cand)
+}
+
+/// Directory names pruned before descent during a glob walk. These hold
+/// build artefacts / dependency trees that a name-pattern search almost
+/// never wants and that can balloon a result list into the megabytes —
+/// enough to blow past the model's context window when the list rides back
+/// into history. Pruned unconditionally (the walk never enters them), which
+/// also keeps the walk fast on large repos.
+pub const FS_GLOB_IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    ".git",
+    "dist",
+    "build",
+    "vendor",
+    ".next",
+    "__pycache__",
+    ".venv",
+];
+
+/// Hard ceiling on paths returned by a single glob walk. Reaching it stops
+/// the walk early (rather than collecting the whole tree and trimming after)
+/// so a pathological pattern can't allocate an unbounded list before we cap
+/// it. Callers learn whether the cap was hit via [`fs_glob_bounded`].
+pub const MAX_FS_GLOB_RESULTS: usize = 2000;
+
+/// Walk `base_dir` recursively and return relative paths that match `pattern`.
+/// Skips hidden directories (`.git`, `.DS_Store`, etc.) unless the pattern
+/// explicitly starts with `.`, prunes dependency / build directories
+/// ([`FS_GLOB_IGNORED_DIRS`]), and caps the result count at
+/// [`MAX_FS_GLOB_RESULTS`]. Results are sorted lexicographically.
+/// Intended for use by production `ToolRuntime` implementations.
+///
+/// When the caller needs to know whether the cap was reached (e.g. to tell
+/// the model the list was truncated), use [`fs_glob_bounded`] — this wrapper
+/// discards that flag for the common case.
+pub fn fs_glob(pattern: &str, base_dir: &std::path::Path) -> Vec<String> {
+    fs_glob_bounded(pattern, base_dir).0
+}
+
+/// Like [`fs_glob`] but also reports whether the [`MAX_FS_GLOB_RESULTS`] cap
+/// was hit. A `true` second element means the returned list is a prefix of
+/// the full match set and the search should be narrowed.
+pub fn fs_glob_bounded(pattern: &str, base_dir: &std::path::Path) -> (Vec<String>, bool) {
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    let mut stack = vec![base_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let rel = match path.strip_prefix(base_dir) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            let first = rel.split('/').next().unwrap_or("");
+            if first.starts_with('.') && !pattern.starts_with('.') {
+                continue;
+            }
+            if !path.is_symlink() && path.is_dir() {
+                // Prune dependency / build trees before descending so their
+                // (often enormous) contents are never read at all.
+                let name = entry.file_name();
+                if FS_GLOB_IGNORED_DIRS.iter().any(|d| name.as_os_str() == *d) {
+                    continue;
+                }
+                stack.push(path);
+            } else if !path.is_dir() && simple_glob_match(pattern, &rel) {
+                if matches.len() >= MAX_FS_GLOB_RESULTS {
+                    truncated = true;
+                    break;
+                }
+                matches.push(rel);
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    matches.sort();
+    (matches, truncated)
+}
+
+/// Canonical specs for the built-in tool set (bash / read / write). Shared
+/// between `MockToolRuntime` (in-process tests) and the production
+/// `SandboxToolRuntime` (in `core` crate) so both report the same schema to
+/// the model. Adding a new built-in tool changes one place.
+///
+/// Note on `additionalProperties: false`: keeps the model from inventing
+/// fields. Required for some providers' strict tool-calling mode.
+pub fn builtin_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "bash".into(),
+            description: "Run a shell command inside the sandbox working directory. \
+                Returns exit code + stdout/stderr. Bounded by `timeout_ms` \
+                (default 120 000 ms, max 600 000 ms) — on timeout the process \
+                is SIGTERM'd and any partial output is returned. For commands \
+                that may run longer than 10 min, use `nohup … &` writing to a \
+                file, then poll the file with the read tool across turns."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute with /bin/sh -lc."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional timeout in milliseconds (default 120000, max 600000).",
+                        "minimum": 1000,
+                        "maximum": 600000
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "read".into(),
+            description:
+                "Read a UTF-8 file from the sandbox. Paginated by line: returns up to `limit` \
+                 lines starting at `offset` (a 0-based line index). When the result is \
+                 `truncated`, read the next page with the returned `next_offset`. Overlong \
+                 lines are clipped."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "0-based line index to start from. Default 0.",
+                        "minimum": 0
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max lines to return. Default 2000.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "write".into(),
+            description: "Write UTF-8 content to a file in the sandbox.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "edit".into(),
+            description:
+                "Edit a UTF-8 file by replacing an exact substring. By default `old_string` must \
+                 appear exactly once; set `replace_all=true` to substitute every occurrence."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {
+                        "type": "string",
+                        "description": "Substring to replace; must match verbatim including whitespace."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text. Empty string deletes the match."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "When true, replace every occurrence. Default false (must be unique)."
+                    }
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "grep".into(),
+            description:
+                "Search file contents under a path using `grep -rnE` (extended regex). Returns \
+                 matching lines as `path:line:text`. Dependency and build directories \
+                 (node_modules, target, …) are skipped; the match count is capped and overlong \
+                 lines are clipped — a `truncated` flag signals when to narrow the pattern or path."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regular expression to search for (passed to grep)."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search under. Default: current cwd."
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "When true, pass -i to grep. Default false."
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "glob".into(),
+            description:
+                "Find files matching a shell-style name pattern (e.g. `*.rs`). Returns relative \
+                 paths under the search root, one per line. Dependency and build directories \
+                 (node_modules, target, dist, …) are skipped, and the result count is capped — \
+                 a `truncated` flag signals when to narrow the pattern or search a subdirectory."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Shell glob like `*.rs` or `**/Cargo.toml`."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search under. Default: current cwd."
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+fn required_str<'a>(
+    invocation: &'a ToolInvocation,
+    key: &str,
+) -> Result<&'a str, ToolRuntimeError> {
+    invocation
+        .input
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolRuntimeError::InvalidInput {
+            tool: invocation.name.clone(),
+            message: format!("missing string field {key}"),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_glob_matches_star_and_doublestar() {
+        assert!(simple_glob_match("*.rs", "main.rs"));
+        assert!(!simple_glob_match("*.rs", "main.rs.bak"));
+        assert!(!simple_glob_match("*.rs", "src/main.rs"));
+        assert!(simple_glob_match("**/*.rs", "src/main.rs"));
+        assert!(simple_glob_match("**/*.rs", "a/b/c.rs"));
+        assert!(simple_glob_match("Cargo.toml", "Cargo.toml"));
+        assert!(!simple_glob_match("Cargo.toml", "Cargo.lock"));
+    }
+
+    #[test]
+    fn simple_glob_matches_brace_alternation() {
+        // The exact shape models emit reflexively.
+        assert!(simple_glob_match("**/*.{ts,tsx}", "src/main.ts"));
+        assert!(simple_glob_match("**/*.{ts,tsx}", "src/components/App.tsx"));
+        assert!(!simple_glob_match("**/*.{ts,tsx}", "src/main.rs"));
+        // Multiple groups multiply out.
+        assert!(simple_glob_match("{src,lib}/*.{ts,js}", "lib/util.js"));
+        assert!(!simple_glob_match("{src,lib}/*.{ts,js}", "bin/util.js"));
+        // Nested groups.
+        assert!(simple_glob_match("*.{t{s,sx}}", "x.tsx"));
+        assert!(simple_glob_match("*.{t{s,sx}}", "x.ts"));
+        // Single alternative and empty alternative.
+        assert!(simple_glob_match("*.{rs}", "main.rs"));
+        assert!(simple_glob_match("a{,b}c", "ac"));
+        assert!(simple_glob_match("a{,b}c", "abc"));
+        // Unbalanced brace stays a literal.
+        assert!(simple_glob_match("a{b", "a{b"));
+        assert!(!simple_glob_match("a{b", "ab"));
+    }
+
+    #[test]
+    fn expand_braces_caps_pathological_patterns() {
+        // 4 groups × 4 alts = 256 > cap; must stop at the cap, not hang.
+        let pat = "{a,b,c,d}{a,b,c,d}{a,b,c,d}{a,b,c,d}";
+        assert_eq!(expand_braces(pat).len(), MAX_BRACE_EXPANSIONS);
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_edit_replaces_unique_substring() {
+        let rt = MockToolRuntime::new().with_file("a.txt", "hello world");
+        let out = rt
+            .invoke(ToolInvocation {
+                id: "tc_edit".into(),
+                name: "edit".into(),
+                input: json!({
+                    "path": "a.txt",
+                    "old_string": "world",
+                    "new_string": "rust",
+                }),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["replaced"], 1);
+        // Confirm new contents readable.
+        let after = rt
+            .invoke(ToolInvocation {
+                id: "tc_read".into(),
+                name: "read".into(),
+                input: json!({"path": "a.txt"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(after["content"], "hello rust");
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_edit_rejects_ambiguous_match() {
+        let rt = MockToolRuntime::new().with_file("a.txt", "foo foo");
+        let failure = rt
+            .invoke(ToolInvocation {
+                id: "tc_edit".into(),
+                name: "edit".into(),
+                input: json!({"path": "a.txt", "old_string": "foo", "new_string": "bar"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap_err();
+        assert_eq!(failure.kind, ToolFailureKind::InvalidInput);
+    }
+
+    // ── F7: JSON-escape auto-repair ──
+
+    #[test]
+    fn unescape_literal_controls_handles_sequences() {
+        assert_eq!(unescape_literal_controls(r"a\nb"), "a\nb");
+        assert_eq!(unescape_literal_controls(r"a\tb"), "a\tb");
+        assert_eq!(unescape_literal_controls(r"a\rb"), "a\rb");
+        // \r\n collapses to a single newline (ordered before \r / \n).
+        assert_eq!(unescape_literal_controls(r"a\r\nb"), "a\nb");
+        // Double backslash is NOT special-cased (Go Replacer semantics):
+        // `\\n` → `\` + newline.
+        assert_eq!(unescape_literal_controls(r"a\\nb"), "a\\\nb");
+        // No escapes → unchanged.
+        assert_eq!(unescape_literal_controls("plain"), "plain");
+    }
+
+    #[test]
+    fn resolve_edit_search_prefers_direct_match() {
+        // Content contains the literal two-char sequence; direct match
+        // wins and no repair fires.
+        let r = resolve_edit_search("say \\n here", r"\n", "x", false).unwrap();
+        assert!(r.repair.is_none());
+        assert_eq!(r.old_string, r"\n");
+    }
+
+    #[test]
+    fn resolve_edit_search_unescapes_literal_controls() {
+        let r = resolve_edit_search("line1\nline2", r"line1\nline2", r"a\tb", false).unwrap();
+        assert_eq!(r.repair, Some("json_escape_unwrapped"));
+        assert_eq!(r.old_string, "line1\nline2");
+        assert_eq!(r.new_string, "a\tb"); // new_string unescaped too
+        assert_eq!(r.occurrences, 1);
+    }
+
+    #[test]
+    fn resolve_edit_search_escaped_not_found() {
+        assert_eq!(
+            resolve_edit_search("other", r"line1\nline2", "x", false).unwrap_err(),
+            EditSearchError::EscapedNotFound
+        );
+    }
+
+    #[test]
+    fn resolve_edit_search_escaped_ambiguous_without_replace_all() {
+        let content = "a\nb a\nb";
+        assert_eq!(
+            resolve_edit_search(content, r"a\nb", "x", false).unwrap_err(),
+            EditSearchError::EscapedAmbiguous { occurrences: 2 }
+        );
+        // replace_all=true accepts the multi-match.
+        let r = resolve_edit_search(content, r"a\nb", "x", true).unwrap();
+        assert_eq!(r.occurrences, 2);
+        assert_eq!(r.repair, Some("json_escape_unwrapped"));
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_edit_repairs_json_escaped_old_string() {
+        let rt = MockToolRuntime::new().with_file("a.txt", "line1\nline2\nline3");
+        let out = rt
+            .invoke(ToolInvocation {
+                id: "tc_edit".into(),
+                name: "edit".into(),
+                // Model emitted literal \n instead of a real newline.
+                input: json!({"path": "a.txt", "old_string": "line1\\nline2", "new_string": "merged"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["replaced"], 1);
+        assert_eq!(out["repair"], "json_escape_unwrapped");
+        let after = rt
+            .invoke(ToolInvocation {
+                id: "tc_read".into(),
+                name: "read".into(),
+                input: json!({"path": "a.txt"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(after["content"], "merged\nline3");
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_grep_finds_matches() {
+        let rt = MockToolRuntime::new()
+            .with_file("a.txt", "alpha\nbeta\nALPHA")
+            .with_file("b.txt", "gamma");
+        let out = rt
+            .invoke(ToolInvocation {
+                id: "tc_grep".into(),
+                name: "grep".into(),
+                input: json!({"pattern": "alpha", "case_insensitive": true}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_glob_matches_by_pattern() {
+        let rt = MockToolRuntime::new()
+            .with_file("src/main.rs", "")
+            .with_file("src/lib.rs", "")
+            .with_file("Cargo.toml", "");
+        let out = rt
+            .invoke(ToolInvocation {
+                id: "tc_glob".into(),
+                name: "glob".into(),
+                input: json!({"pattern": "**/*.rs"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_supports_bash_read_write() {
+        let rt = MockToolRuntime::new().with_file("README.md", "hello");
+        let read = rt
+            .invoke(ToolInvocation {
+                id: "tc_read".into(),
+                name: "read".into(),
+                input: json!({"path":"README.md"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.output.unwrap()["content"], "hello");
+
+        let write = rt
+            .invoke(ToolInvocation {
+                id: "tc_write".into(),
+                name: "write".into(),
+                input: json!({"path":"out.txt", "content":"ok"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(write.output.unwrap()["written"], true);
+
+        let bash = rt
+            .invoke(ToolInvocation {
+                id: "tc_bash".into(),
+                name: "bash".into(),
+                input: json!({"command":"pwd"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(bash.output.unwrap()["exit_code"], 0);
+    }
+
+    #[test]
+    fn fs_glob_prunes_dependency_dirs() {
+        // Regression: a wide glob must NOT descend into node_modules/target,
+        // whose contents previously ballooned a result list into the
+        // megabytes and blew past the model's context window.
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("harness_fsglob_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for sub in ["src", "node_modules/dep", "target/debug"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        fs::write(root.join("keep.rs"), "").unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(root.join("node_modules/dep/skip.rs"), "").unwrap();
+        fs::write(root.join("target/debug/skip.rs"), "").unwrap();
+
+        let (matches, truncated) = fs_glob_bounded("**.rs", &root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!truncated);
+        assert!(matches.iter().any(|m| m == "keep.rs"), "{matches:?}");
+        assert!(matches.iter().any(|m| m == "src/lib.rs"), "{matches:?}");
+        assert!(
+            !matches
+                .iter()
+                .any(|m| m.contains("node_modules") || m.contains("target")),
+            "pruned dirs leaked into results: {matches:?}"
+        );
+    }
+}
