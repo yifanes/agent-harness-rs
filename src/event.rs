@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -104,13 +106,25 @@ pub struct NativeTurnInput {
     /// and for fire-and-forget turns); production wires this through
     /// from RD's `active_native_cancel`.
     pub cancel_token: Option<CancellationToken>,
-    /// Prior `messages` history to seed the loop with (snapshot taken
-    /// at the previous `TurnEnd.final_messages`). Empty Vec = fresh
-    /// conversation; the loop appends the new
-    /// `ChatMessage::User { prompt_text, attachments }` after this Vec.
-    /// RD owns the storage; harness just consumes and returns the new
-    /// final snapshot on `TurnEnd`.
+    /// Prior `messages` history for **in-memory** mode (`context_path = None`).
+    /// Ignored when `context_path` is `Some` — harness loads history from
+    /// the JSONL file instead.
+    ///
+    /// Empty Vec + `context_path = None` = fresh in-memory conversation.
     pub prior_messages: Vec<ChatMessage>,
+
+    /// Absolute path to harness's context JSONL.
+    ///
+    /// * `Some(path)` — **persistent mode**: harness loads prior messages
+    ///   from this file at turn start (creating it on first use), appends
+    ///   new messages incrementally, and rewrites it on compaction.
+    ///   `prior_messages` is ignored. `TurnEnd.final_messages` is empty.
+    ///
+    /// * `None` — **in-memory mode**: `prior_messages` is used as the seed;
+    ///   harness never touches the filesystem. `TurnEnd.final_messages`
+    ///   carries the full history snapshot for the caller to persist.
+    ///   Suitable for runtime-driver (manages history in RAM) and tests.
+    pub context_path: Option<PathBuf>,
 }
 
 impl PartialEq for NativeTurnInput {
@@ -123,6 +137,7 @@ impl PartialEq for NativeTurnInput {
             && self.system_prompt == other.system_prompt
             && self.attachments == other.attachments
             && self.prior_messages == other.prior_messages
+            && self.context_path == other.context_path
     }
 }
 

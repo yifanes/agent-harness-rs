@@ -188,20 +188,33 @@ async fn run_loop<M, R>(
 {
     let system_prompt = input.system_prompt.clone();
     let cancel_token = input.cancel_token.clone();
+    let context_path = input.context_path.clone();
     // Snapshot tool specs once per turn — adding / removing tools mid-turn
     // would invalidate cached prompt prefixes on every provider that does
     // any caching, so we treat the spec list as immutable for one turn.
     let tools_snapshot = tools.specs();
-    // Seed history with the prior-turn `final_messages` (if any) and
-    // then append the new user prompt. Same-process multi-turn lives
-    // here: RD hands us back the snapshot it captured on the previous
-    // TurnEnd so the model sees the whole conversation, not just the
-    // latest prompt. Empty prior_messages ⇒ fresh conversation.
-    let mut messages: Vec<ChatMessage> = input.prior_messages;
+    // Seed history: load from context JSONL when a path is provided
+    // (persistent mode), otherwise use the in-memory prior_messages.
+    let mut messages: Vec<ChatMessage> = if let Some(ref path) = context_path {
+        crate::context::jsonl::load_context(path).await
+    } else {
+        input.prior_messages
+    };
     messages.push(ChatMessage::User {
         content: input.prompt_text,
         attachments: input.attachments,
     });
+    // Cursor: how many messages have been flushed to the context JSONL.
+    // Set to messages.len() after the initial User flush (Some path),
+    // or 0 when running in-memory (None — ctx_written is never read).
+    let mut ctx_written: usize = match context_path.as_deref() {
+        None => 0,
+        Some(path) => {
+            let start = messages.len() - 1;
+            crate::context::jsonl::append_context(path, &messages[start..]).await;
+            messages.len()
+        }
+    };
     // Per-turn accumulated token usage. Each model call may report a
     // fresh `HarnessUsage` (provider reports per-call counts, not deltas);
     // we sum them so `TurnEnd.usage` reflects what the whole turn cost.
@@ -220,7 +233,7 @@ async fn run_loop<M, R>(
                     .send(Ok(HarnessInternalEvent::TurnEnd {
                         stop_reason: "interrupt".into(),
                         usage: saw_any_usage.then(|| total_usage.clone()),
-                        final_messages: messages.clone(),
+                        final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
                     }))
                     .await;
                 return;
@@ -287,9 +300,11 @@ async fn run_loop<M, R>(
                             context_window_tokens = policy.context_window_tokens,
                             "compaction applied"
                         );
-                        // Emit event for HR-side visibility. native_adapter
-                        // currently drops this on the floor (no proto frame
-                        // reserved yet); harness tests still assert on it.
+                        // Rewrite the context JSONL with the compacted history.
+                        if let Some(ref path) = context_path {
+                            crate::context::jsonl::rewrite_context(path, &messages).await;
+                            ctx_written = messages.len();
+                        }
                         if tx
                             .send(Ok(HarnessInternalEvent::CompactionApplied {
                                 original_message_count: original_count,
@@ -402,7 +417,7 @@ async fn run_loop<M, R>(
                         .send(Ok(HarnessInternalEvent::TurnEnd {
                             stop_reason: "interrupt".into(),
                             usage: saw_any_usage.then(|| total_usage.clone()),
-                            final_messages: messages.clone(),
+                            final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
                         }))
                         .await;
                     return;
@@ -471,13 +486,19 @@ async fn run_loop<M, R>(
                     tool_calls: vec![],
                     thinking: outcome.thinking.clone(),
                 });
+                // Persist the final Assistant message to context JSONL.
+                if let Some(ref path) = context_path {
+                    crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
+                    ctx_written = messages.len();
+                }
                 // Note: AssistantTextChunk events were already emitted
                 // mid-stream, so there's nothing more to send here.
+                let final_msgs = if context_path.is_none() { messages.clone() } else { vec![] };
                 let _ = tx
                     .send(Ok(HarnessInternalEvent::TurnEnd {
                         stop_reason,
                         usage: saw_any_usage.then(|| total_usage.clone()),
-                        final_messages: messages.clone(),
+                        final_messages: final_msgs,
                     }))
                     .await;
                 return;
@@ -590,7 +611,7 @@ async fn run_loop<M, R>(
                             .send(Ok(HarnessInternalEvent::TurnEnd {
                                 stop_reason: "interrupt".into(),
                                 usage: saw_any_usage.then(|| total_usage.clone()),
-                                final_messages: messages.clone(),
+                                final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
                             }))
                             .await;
                         return;
@@ -650,17 +671,27 @@ async fn run_loop<M, R>(
                     let _ = tx.send(Err(NativeHarnessError::ToolRuntime(err))).await;
                     return;
                 }
+                // Flush the Assistant + all Tool messages for this step.
+                if let Some(ref path) = context_path {
+                    crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
+                    ctx_written = messages.len();
+                }
                 // Continue the loop — next step will see the tool
                 // results in `messages` and decide what to do.
             }
         }
     }
 
+    // max_turns reached — also flush any unflushed messages.
+    if let Some(ref path) = context_path {
+        crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
+    }
+    let final_msgs = if context_path.is_none() { messages } else { vec![] };
     let _ = tx
         .send(Ok(HarnessInternalEvent::TurnEnd {
             stop_reason: "max_turns".into(),
             usage: saw_any_usage.then(|| total_usage.clone()),
-            final_messages: messages,
+            final_messages: final_msgs,
         }))
         .await;
 }
