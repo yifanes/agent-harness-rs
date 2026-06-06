@@ -3,6 +3,9 @@ pub mod sandbox;
 
 #[cfg(feature = "local-tools")]
 pub mod local;
+
+#[cfg(feature = "e2b")]
+pub mod e2b;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

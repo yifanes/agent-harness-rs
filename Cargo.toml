@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Agent loop harness with local and sandbox tool runtimes, context management, and MCP support"
 repository = "https://github.com/yourusername/agent-harness-rs"
-keywords = ["agent", "llm", "tool-calling", "mcp", "sandbox"]
+keywords = ["agent", "llm", "tool-calling", "mcp", "e2b"]
 categories = ["asynchronous", "api-bindings"]
 
 [lib]
@@ -26,14 +26,17 @@ tracing            = "0.1"
 uuid               = { version = "1", features = ["v4"] }
 base64             = "0.22"
 
+# e2b feature: Connect Protocol to envd
+prost   = { version = "0.13", optional = true }
+bytes   = { version = "1",    optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
+[build-dependencies]
+prost-build = { version = "0.13", optional = true }
+
 [features]
 default = ["local-tools"]
-
-# Local filesystem + bash tool runtime (bash/read/write/edit/glob/grep)
 local-tools = []
-
-# E2b sandbox tool runtime — calls e2b HTTP API via reqwest (already a dep)
-e2b = []
+e2b = ["dep:prost", "dep:bytes", "dep:prost-build"]

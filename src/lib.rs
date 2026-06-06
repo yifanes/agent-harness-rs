@@ -45,3 +45,7 @@ pub use tools::approval::{ApprovalGate, PlanApproval, YoloApproval};
 
 // ── New: sandbox tool runtime ─────────────────────────────────────────────────
 pub use tools::sandbox::{ExecResult, SandboxExecutor, SandboxToolConfig, SandboxToolRuntime};
+
+// ── New: e2b sandbox ──────────────────────────────────────────────────────────
+#[cfg(feature = "e2b")]
+pub use tools::e2b::{E2bConfig, E2bError, E2bToolRuntime};
