@@ -77,6 +77,77 @@ impl std::fmt::Display for ToolFailure {
     }
 }
 
+pub fn invalid_input_failure(tool: &str, message: impl AsRef<str>, input: &Value) -> ToolFailure {
+    ToolFailure::new(
+        ToolFailureKind::InvalidInput,
+        format_invalid_input_message(tool, message.as_ref(), input),
+    )
+}
+
+pub fn format_invalid_input_message(tool: &str, detail: &str, input: &Value) -> String {
+    let received = received_fields(input);
+    let summaries = summarize_input_fields(input);
+    let mut message = format!(
+        "The {tool} tool was called with invalid arguments: {detail}. \
+Please rewrite the input so it satisfies the expected schema."
+    );
+    if !received.is_empty() {
+        message.push_str(&format!(" Received fields: {}.", received.join(", ")));
+    }
+    if !summaries.is_empty() {
+        message.push_str(&format!(" Field summary: {}.", summaries.join("; ")));
+    }
+    message
+}
+
+fn received_fields(input: &Value) -> Vec<String> {
+    let Some(obj) = input.as_object() else {
+        return vec![json_type(input).to_string()];
+    };
+    let mut keys: Vec<String> = obj.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+fn summarize_input_fields(input: &Value) -> Vec<String> {
+    let Some(obj) = input.as_object() else {
+        return vec![format!("input: {}", summarize_value(input))];
+    };
+    let mut entries: Vec<_> = obj.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
+        .take(12)
+        .map(|(key, value)| format!("{key}: {}", summarize_value(value)))
+        .collect()
+}
+
+fn summarize_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => {
+            let preview: String = s.chars().take(80).collect();
+            let suffix = if s.chars().count() > 80 { "..." } else { "" };
+            format!("string({} chars, preview={:?}{suffix})", s.chars().count(), preview)
+        }
+        Value::Array(a) => format!("array({} items)", a.len()),
+        Value::Object(o) => format!("object({} keys)", o.len()),
+        Value::Bool(_) => "boolean".into(),
+        Value::Number(_) => "number".into(),
+        Value::Null => "null".into(),
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolRuntimeError {
     #[error("unknown tool {0}")]
@@ -218,16 +289,16 @@ impl ToolRuntime for MockToolRuntime {
                     Err(e) => {
                         let message = match e {
                             EditSearchError::NotFound => {
-                                format!("old_string not found in {path}")
+                                format!("Could not find old_string in the file. It must match exactly, including whitespace and indentation. Read the file again before retrying.")
                             }
                             EditSearchError::EscapedNotFound => format!(
-                                "old_string not found in {path}; old_string appears JSON-escaped, but the unescaped text was also not found"
+                                "Could not find old_string in the file, even after checking for JSON-escaped text. It must match exactly, including whitespace and indentation. Read the file again before retrying."
                             ),
                             EditSearchError::Ambiguous { occurrences } => format!(
-                                "old_string matches {occurrences} occurrences; pass replace_all=true or supply a unique substring"
+                                "Found {occurrences} exact matches for old_string. Provide more surrounding context or set replace_all=true."
                             ),
                             EditSearchError::EscapedAmbiguous { occurrences } => format!(
-                                "old_string not found in {path}; old_string appears JSON-escaped, but the unescaped text matches {occurrences} occurrences; pass replace_all=true or supply a unique substring"
+                                "old_string appears JSON-escaped and matches {occurrences} occurrences after unescaping. Provide more surrounding context or set replace_all=true."
                             ),
                         };
                         return Ok(ToolOutcome {
@@ -660,9 +731,10 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "bash".into(),
             description: "Run a shell command inside the sandbox working directory. \
-                Returns exit code + stdout/stderr. Bounded by `timeout_ms` \
+                Returns structured command status + stdout/stderr, including non-zero \
+                exits and timeouts. Bounded by `timeout_ms` \
                 (default 120 000 ms, max 600 000 ms) — on timeout the process \
-                is SIGTERM'd and any partial output is returned. For commands \
+                is terminated and any captured output is returned. For commands \
                 that may run longer than 10 min, use `nohup … &` writing to a \
                 file, then poll the file with the read tool across turns."
                 .into(),
@@ -671,11 +743,17 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute with /bin/sh -lc."
+                        "description": "Shell command to execute. Local runtimes prefer /bin/bash -lc when available and fall back to /bin/sh -lc."
                     },
                     "timeout_ms": {
                         "type": "integer",
                         "description": "Optional timeout in milliseconds (default 120000, max 600000).",
+                        "minimum": 1000,
+                        "maximum": 600000
+                    },
+                    "soft_timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional no-output timeout in milliseconds (default 10000). Streaming output resets this timer.",
                         "minimum": 1000,
                         "maximum": 600000
                     }

@@ -151,6 +151,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();

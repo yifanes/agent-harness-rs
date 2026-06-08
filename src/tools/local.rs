@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -178,8 +178,11 @@ async fn bash_invoke(
         .min(3_600_000);
 
     let last_out = Arc::new(AtomicU64::new(epoch_ms()));
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
 
-    let mut child = Command::new("/bin/sh")
+    let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
+    let mut child = Command::new(shell)
         .args(["-lc", command])
         .current_dir(cwd)
         .kill_on_drop(true)
@@ -193,6 +196,7 @@ async fn bash_invoke(
 
     let act1 = last_out.clone();
     let emit_out = emit.clone();
+    let stdout_acc = stdout_buf.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(raw_stdout).lines();
         let mut buf = String::new();
@@ -201,12 +205,17 @@ async fn bash_invoke(
             act1.store(epoch_ms(), Ordering::Relaxed);
             buf.push_str(&line);
             buf.push('\n');
+            if let Ok(mut acc) = stdout_acc.lock() {
+                acc.push_str(&line);
+                acc.push('\n');
+            }
         }
         buf
     });
 
     let act2 = last_out.clone();
     let emit_err = emit.clone();
+    let stderr_acc = stderr_buf.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(raw_stderr).lines();
         let mut buf = String::new();
@@ -215,6 +224,10 @@ async fn bash_invoke(
             act2.store(epoch_ms(), Ordering::Relaxed);
             buf.push_str(&line);
             buf.push('\n');
+            if let Ok(mut acc) = stderr_acc.lock() {
+                acc.push_str(&line);
+                acc.push('\n');
+            }
         }
         buf
     });
@@ -244,20 +257,33 @@ async fn bash_invoke(
 
     let hard_timer = tokio::time::sleep(Duration::from_millis(hard_ms));
 
-    let soft_err = |tot: u64, sil: u64| ToolOutcome {
-        output: Err(ToolFailure::new(ToolFailureKind::Timeout, format!(
-            "Soft timeout: no output for {sil}ms (total: {tot}ms). \
-             Pass `soft_timeout_ms` or `timeout_ms` to extend."
-        ))),
+    let timeout_outcome = |kind: &str, message: String| ToolOutcome {
+        output: Ok(json!({
+            "command": command,
+            "shell": shell,
+            "stdout": truncate(stdout_buf.lock().map(|s| s.clone()).unwrap_or_default()),
+            "stderr": truncate(stderr_buf.lock().map(|s| s.clone()).unwrap_or_default()),
+            "exit_code": null,
+            "success": false,
+            "timed_out": true,
+            "timeout_kind": kind,
+            "message": message,
+        })),
         attachments: vec![],
     };
-    let hard_err = || ToolOutcome {
-        output: Err(ToolFailure::new(ToolFailureKind::Timeout, format!(
-            "Hard timeout: command did not finish in {hard_ms}ms. \
-             Pass `timeout_ms` to extend (max 3 600 000)."
-        ))),
-        attachments: vec![],
-    };
+    let soft_err = |tot: u64, sil: u64| timeout_outcome(
+        "soft",
+        format!(
+            "Command produced no output for {sil}ms (total {tot}ms). \
+Retry with larger `soft_timeout_ms` or `timeout_ms` if it is expected to take longer."
+        ),
+    );
+    let hard_err = || timeout_outcome(
+        "hard",
+        format!(
+            "Command did not finish in {hard_ms}ms. Retry with a larger `timeout_ms` if it is expected to take longer."
+        ),
+    );
 
     let result: Result<(String, String, _), ToolOutcome> = if let Some(tok) = cancel {
         tokio::select! {
@@ -284,24 +310,17 @@ async fn bash_invoke(
 
     let exit_code = status_result.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-    if exit_code != 0 {
-        Ok(ToolOutcome {
-            output: Err(ToolFailure::new(
-                ToolFailureKind::NonZeroExit,
-                truncate(format!("exit {exit_code}\nstdout: {stdout}\nstderr: {stderr}")),
-            )),
-            attachments: vec![],
-        })
-    } else {
-        Ok(ToolOutcome {
-            output: Ok(json!({
-                "stdout": truncate(stdout),
-                "stderr": truncate(stderr),
-                "exit_code": exit_code,
-            })),
-            attachments: vec![],
-        })
-    }
+    Ok(ToolOutcome {
+        output: Ok(json!({
+            "command": command,
+            "shell": shell,
+            "stdout": truncate(stdout),
+            "stderr": truncate(stderr),
+            "exit_code": exit_code,
+            "success": exit_code == 0,
+        })),
+        attachments: vec![],
+    })
 }
 
 // ── read ──────────────────────────────────────────────────────────────────────
@@ -396,14 +415,14 @@ async fn edit_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
     if occurrences == 0 {
         return Ok(ToolOutcome {
             output: Err(ToolFailure::new(ToolFailureKind::InvalidInput,
-                format!("old_string not found in {}", resolved.display()))),
+                "Could not find old_string in the file. It must match exactly, including whitespace and indentation. Read the file again before retrying.".to_string())),
             attachments: vec![],
         });
     }
     if !replace_all && occurrences > 1 {
         return Ok(ToolOutcome {
             output: Err(ToolFailure::new(ToolFailureKind::InvalidInput,
-                format!("{occurrences} occurrences; pass replace_all=true"))),
+                format!("Found {occurrences} exact matches for old_string. Provide more surrounding context or set replace_all=true."))),
             attachments: vec![],
         });
     }
@@ -527,4 +546,76 @@ fn req_str<'a>(inv: &'a ToolInvocation, key: &str) -> Result<&'a str, ToolRuntim
             tool: inv.name.clone(),
             message: format!("missing field `{key}`"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::approval::YoloApproval;
+
+    fn runtime() -> LocalToolRuntime {
+        LocalToolRuntime::new(LocalToolConfig {
+            cwd: Some(std::env::temp_dir()),
+            approval: Arc::new(YoloApproval),
+            emit: Arc::new(|_| {}),
+        })
+    }
+
+    #[tokio::test]
+    async fn bash_non_zero_exit_returns_structured_result() {
+        let out = runtime()
+            .invoke(ToolInvocation {
+                id: "tc_nonzero".into(),
+                name: "bash".into(),
+                input: json!({"command": "printf nope >&2; exit 7"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["exit_code"], 7);
+        assert_eq!(out["success"], false);
+        assert_eq!(out["stderr"], "nope\n");
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_returns_structured_result() {
+        let out = runtime()
+            .invoke(ToolInvocation {
+                id: "tc_timeout".into(),
+                name: "bash".into(),
+                input: json!({
+                    "command": "sleep 2",
+                    "soft_timeout_ms": 1000,
+                    "timeout_ms": 5000
+                }),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["success"], false);
+        assert_eq!(out["timed_out"], true);
+        assert_eq!(out["timeout_kind"], "soft");
+    }
+
+    #[tokio::test]
+    async fn bash_tool_supports_bash_syntax_when_bash_exists() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let out = runtime()
+            .invoke(ToolInvocation {
+                id: "tc_bash_syntax".into(),
+                name: "bash".into(),
+                input: json!({"command": "diff <(printf a) <(printf a)"}),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["success"], true);
+        assert_eq!(out["exit_code"], 0);
+        assert_eq!(out["shell"], "/bin/bash");
+    }
 }

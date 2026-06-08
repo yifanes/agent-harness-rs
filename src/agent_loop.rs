@@ -489,7 +489,6 @@ async fn run_loop<M, R>(
                 // Persist the final Assistant message to context JSONL.
                 if let Some(ref path) = context_path {
                     crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
-                    ctx_written = messages.len();
                 }
                 // Note: AssistantTextChunk events were already emitted
                 // mid-stream, so there's nothing more to send here.
@@ -619,15 +618,20 @@ async fn run_loop<M, R>(
                 };
 
                 // Walk invocations + outcomes pairwise to keep ordering
-                // stable. Tool timeouts are model-observable failures;
-                // infrastructure/runtime errors still fail the turn.
+                // stable. Tool timeouts and invalid model-supplied inputs are
+                // model-observable failures; infrastructure/runtime errors
+                // still fail the turn.
                 let mut runtime_error: Option<String> = None;
                 for (inv, outcome) in pairs {
-                    let id = inv.id;
+                    let id = inv.id.clone();
                     let outcome = match outcome {
                         Ok(o) => o,
                         Err(ToolRuntimeError::Timeout(message)) => ToolOutcome {
                             output: Err(ToolFailure::new(ToolFailureKind::Timeout, message)),
+                            attachments: vec![],
+                        },
+                        Err(ToolRuntimeError::InvalidInput { tool, message }) => ToolOutcome {
+                            output: Err(crate::tools::invalid_input_failure(&tool, message, &inv.input)),
                             attachments: vec![],
                         },
                         Err(e) => {
@@ -1194,6 +1198,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1228,6 +1233,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1302,6 +1308,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1383,6 +1390,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1458,6 +1466,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1562,6 +1571,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1652,6 +1662,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1675,6 +1686,69 @@ mod tests {
         assert!(matches!(
             rx.recv().await.unwrap().unwrap(),
             HarnessInternalEvent::TurnEnd { ref stop_reason, .. } if stop_reason == "end_turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_invalid_tool_input_is_model_observable_and_bounded() {
+        let huge_content = "x".repeat(20_000);
+        let model = StreamingFakeClient::new(vec![
+            vec![
+                ModelChunk::ToolCallStart {
+                    id: "tc_bad_write".into(),
+                    name: "write".into(),
+                },
+                ModelChunk::ToolCallEnd {
+                    id: "tc_bad_write".into(),
+                    input: Some(json!({"content": huge_content})),
+                },
+                ModelChunk::Done {
+                    stop_reason: "tool_use".into(),
+                    usage: None,
+                },
+            ],
+            vec![
+                ModelChunk::TextDelta {
+                    msg_id: "r2".into(),
+                    delta: "recovered".into(),
+                },
+                ModelChunk::Done {
+                    stop_reason: "end_turn".into(),
+                    usage: None,
+                },
+            ],
+        ]);
+        let harness = AgentLoopHarness::new(model, MockToolRuntime::new());
+        let mut rx = harness
+            .run_turn(NativeTurnInput {
+                prompt_text: "write file".into(),
+                system_prompt: None,
+                attachments: vec![],
+                cancel_token: None,
+                prior_messages: vec![],
+                context_path: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            HarnessInternalEvent::ToolCall { .. }
+        ));
+        match rx.recv().await.unwrap().unwrap() {
+            HarnessInternalEvent::ToolResult { output, .. } => {
+                let err = output.unwrap_err();
+                assert!(err.contains("The write tool was called with invalid arguments"));
+                assert!(err.contains("missing string field path"));
+                assert!(err.contains("Received fields: content"));
+                assert!(err.contains("string(20000 chars"));
+                assert!(!err.contains(&"x".repeat(2000)), "error should not echo full content");
+            }
+            other => panic!("expected invalid-input ToolResult, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            HarnessInternalEvent::AssistantTextChunk { ref delta, .. } if delta == "recovered"
         ));
     }
 
@@ -1771,6 +1845,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1849,6 +1924,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -1939,6 +2015,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: Some(cancel),
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2073,6 +2150,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2113,6 +2191,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2163,6 +2242,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2230,6 +2310,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2274,6 +2355,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2334,6 +2416,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: prior,
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2541,6 +2624,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: None,
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2608,6 +2692,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: Some(cancel_for_input),
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();
@@ -2683,6 +2768,7 @@ mod tests {
                 attachments: vec![],
                 cancel_token: Some(cancel_for_input),
                 prior_messages: vec![],
+                context_path: None,
             })
             .await
             .unwrap();

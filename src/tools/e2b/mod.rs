@@ -598,21 +598,28 @@ impl E2bToolRuntime {
 
         match result {
             Err(e) => Ok(ToolOutcome {
-                output: Err(ToolFailure::new(ToolFailureKind::Runtime, e)),
-                attachments: vec![],
-            }),
-            Ok(r) if r.exit_code != 0 => Ok(ToolOutcome {
-                output: Err(ToolFailure::new(
-                    ToolFailureKind::NonZeroExit,
-                    truncate(format!("exit {}\nstdout: {}\nstderr: {}", r.exit_code, r.stdout, r.stderr)),
-                )),
+                output: if e.to_lowercase().contains("timed out") || e.to_lowercase().contains("timeout") {
+                    Ok(json!({
+                        "command": cmd,
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": null,
+                        "success": false,
+                        "timed_out": true,
+                        "message": e,
+                    }))
+                } else {
+                    Err(ToolFailure::new(ToolFailureKind::Runtime, e))
+                },
                 attachments: vec![],
             }),
             Ok(r) => Ok(ToolOutcome {
                 output: Ok(json!({
+                    "command": cmd,
                     "stdout": truncate(r.stdout),
                     "stderr": truncate(r.stderr),
                     "exit_code": r.exit_code,
+                    "success": r.exit_code == 0,
                 })),
                 attachments: vec![],
             }),
@@ -700,14 +707,14 @@ impl E2bToolRuntime {
         if occurrences == 0 {
             return Ok(ToolOutcome {
                 output: Err(ToolFailure::new(ToolFailureKind::InvalidInput,
-                    format!("old_string not found in {abs}"))),
+                    "Could not find old_string in the file. It must match exactly, including whitespace and indentation. Read the file again before retrying.".to_string())),
                 attachments: vec![],
             });
         }
         if !replace_all && occurrences > 1 {
             return Ok(ToolOutcome {
                 output: Err(ToolFailure::new(ToolFailureKind::InvalidInput,
-                    format!("{occurrences} occurrences; pass replace_all=true"))),
+                    format!("Found {occurrences} exact matches for old_string. Provide more surrounding context or set replace_all=true."))),
                 attachments: vec![],
             });
         }

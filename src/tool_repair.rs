@@ -347,6 +347,7 @@ pub const REPAIR_EMPTY_OBJECT_TO_ARRAY: &str = "empty_object_to_array";
 pub const REPAIR_MARKDOWN_AUTOLINK_PATH: &str = "markdown_autolink_path";
 pub const REPAIR_SEMANTIC_BOOLEAN: &str = "semantic_boolean_string";
 pub const REPAIR_SEMANTIC_INTEGER: &str = "semantic_integer_string";
+pub const REPAIR_FIELD_ALIAS: &str = "field_alias";
 
 /// One applied repair, for tracing / telemetry.
 #[derive(Debug, Clone, PartialEq)]
@@ -389,7 +390,8 @@ pub fn repair_tool_input_for_spec(
         return None;
     }
     let mut work = input.clone();
-    let mut repairs = collect_path_string_repairs(schema, &mut work, "");
+    let mut repairs = collect_field_alias_repairs(schema, &mut work);
+    repairs.extend(collect_path_string_repairs(schema, &mut work, ""));
     let issues = collect_issues(schema, &work, "", &[], true);
     if issues.is_empty() && repairs.is_empty() {
         return None;
@@ -407,6 +409,54 @@ pub fn repair_tool_input_for_spec(
         return None;
     }
     Some((work, repairs))
+}
+
+/// Repair common model-facing field aliases only when the target field is part
+/// of the advertised schema and is currently absent. This is intentionally a
+/// rename, not inference from conversation state.
+fn collect_field_alias_repairs(schema: &Value, value: &mut Value) -> Vec<ToolInputRepair> {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return vec![];
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return vec![];
+    };
+    let aliases = [
+        ("filePath", "path"),
+        ("oldString", "old_string"),
+        ("newString", "new_string"),
+        ("replaceAll", "replace_all"),
+        ("cmd", "command"),
+    ];
+    let mut out = Vec::new();
+    for (from, to) in aliases {
+        if !props.contains_key(to) || obj.contains_key(to) {
+            continue;
+        }
+        let Some(value) = obj.remove(from) else {
+            continue;
+        };
+        let before_type = json_type_name(&value);
+        obj.insert(to.to_string(), value);
+        out.push(ToolInputRepair {
+            kind: REPAIR_FIELD_ALIAS,
+            path: to.to_string(),
+            before_type,
+            after_type: before_type,
+        });
+    }
+    out
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// Walk `value` along `segs`, mutably.
@@ -901,6 +951,36 @@ mod tests {
     }
 
     // ── schema-guided repair ──
+
+    #[test]
+    fn spec_repairs_safe_field_aliases() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"}
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        });
+        let input = json!({
+            "filePath": "src/lib.rs",
+            "oldString": "before",
+            "newString": "after",
+            "replaceAll": "true"
+        });
+        let (out, repairs) = repair_tool_input_for_spec(&schema, &input).unwrap();
+        assert_eq!(out, json!({
+            "path": "src/lib.rs",
+            "old_string": "before",
+            "new_string": "after",
+            "replace_all": true
+        }));
+        assert!(repairs.iter().any(|r| r.kind == REPAIR_FIELD_ALIAS && r.path == "path"));
+        assert!(repairs.iter().any(|r| r.kind == REPAIR_SEMANTIC_BOOLEAN && r.path == "replace_all"));
+    }
 
     fn repair_test_schema() -> Value {
         json!({
