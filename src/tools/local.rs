@@ -162,6 +162,7 @@ async fn bash_invoke(
     emit: EmitFn,
 ) -> Result<ToolOutcome, ToolRuntimeError> {
     let command = req_str(&inv, "command")?;
+    let id = &*inv.id;
 
     // Dual-layer timeout:
     //   soft_timeout_ms — no-output detector: if the process produces
@@ -261,8 +262,8 @@ async fn bash_invoke(
         output: Ok(json!({
             "command": command,
             "shell": shell,
-            "stdout": truncate(stdout_buf.lock().map(|s| s.clone()).unwrap_or_default()),
-            "stderr": truncate(stderr_buf.lock().map(|s| s.clone()).unwrap_or_default()),
+            "stdout": bound_output(stdout_buf.lock().map(|s| s.clone()).unwrap_or_default(), id, "stdout"),
+            "stderr": bound_output(stderr_buf.lock().map(|s| s.clone()).unwrap_or_default(), id, "stderr"),
             "exit_code": null,
             "success": false,
             "timed_out": true,
@@ -314,8 +315,8 @@ Retry with larger `soft_timeout_ms` or `timeout_ms` if it is expected to take lo
         output: Ok(json!({
             "command": command,
             "shell": shell,
-            "stdout": truncate(stdout),
-            "stderr": truncate(stderr),
+            "stdout": bound_output(stdout, id, "stdout"),
+            "stderr": bound_output(stderr, id, "stderr"),
             "exit_code": exit_code,
             "success": exit_code == 0,
         })),
@@ -513,7 +514,7 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
             Ok(ToolOutcome {
                 output: Ok(json!({
                     "pattern": pattern,
-                    "matches": truncate(stdout),
+                    "matches": bound_output(stdout, &inv.id, "matches"),
                 })),
                 attachments: vec![],
             })
@@ -523,16 +524,28 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
 
 // ── output cap ────────────────────────────────────────────────────────────────
 
-const MAX_TOOL_CHARS: usize = 60_000;
-
-fn truncate(s: String) -> String {
-    let n = s.chars().count();
-    if n <= MAX_TOOL_CHARS { return s; }
-    let kept: String = s.chars().take(MAX_TOOL_CHARS).collect();
+/// Write `content` to `/tmp/harness_out_{id}_{suffix}.txt` and return a
+/// preview with the path. Used for bash stdout/stderr and grep matches.
+fn bound_output(content: String, id: &str, suffix: &str) -> String {
+    if content.len() <= crate::tools::MAX_OUTPUT_BYTES {
+        return content;
+    }
+    let path = format!("/tmp/harness_out_{id}_{suffix}.txt");
+    let _ = std::fs::write(&path, &content);
+    let preview: String = content.chars().take(crate::tools::MAX_OUTPUT_BYTES / 2).collect();
     format!(
-        "{kept}\n\n[output truncated: {n} chars total, showing first {MAX_TOOL_CHARS}. \
-         Use a narrower command, path, or offset/limit to see more.]"
+        "{preview}\n\n[{} bytes total, truncated. \
+         Full output saved to {path} — use the read tool to fetch more.]",
+        content.len()
     )
+}
+
+/// Simple safety truncation used only by the read tool as a backstop for
+/// pages that exceed the output budget after pagination.
+fn truncate(s: String) -> String {
+    if s.len() <= crate::tools::MAX_OUTPUT_BYTES { return s; }
+    let kept: String = s.chars().take(crate::tools::MAX_OUTPUT_BYTES).collect();
+    format!("{kept}\n\n[content truncated: use offset/limit to read more]")
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

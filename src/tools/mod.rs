@@ -659,6 +659,12 @@ pub const FS_GLOB_IGNORED_DIRS: &[&str] = &[
 /// it. Callers learn whether the cap was hit via [`fs_glob_bounded`].
 pub const MAX_FS_GLOB_RESULTS: usize = 2000;
 
+/// Output size cap before spilling to a temporary file. When a tool produces
+/// more bytes than this, runtimes write the full content to
+/// `/tmp/harness_out_<call_id>_<suffix>.txt` and return a preview with the
+/// path so the model can fetch the rest with the read tool if needed.
+pub const MAX_OUTPUT_BYTES: usize = 50_000;
+
 /// Walk `base_dir` recursively and return relative paths that match `pattern`.
 /// Skips hidden directories (`.git`, `.DS_Store`, etc.) unless the pattern
 /// explicitly starts with `.`, prunes dependency / build directories

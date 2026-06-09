@@ -582,6 +582,23 @@ impl ToolRuntime for E2bToolRuntime {
 // ── per-tool implementations ──────────────────────────────────────────────────
 
 impl E2bToolRuntime {
+    /// Write `content` to `/tmp/harness_out_{id}_{suffix}.txt` inside the
+    /// sandbox and return a preview with the path, or return unchanged if
+    /// content is within the output budget.
+    async fn bound_output(&self, content: String, id: &str, suffix: &str) -> String {
+        if content.len() <= crate::tools::MAX_OUTPUT_BYTES {
+            return content;
+        }
+        let path = format!("/tmp/harness_out_{id}_{suffix}.txt");
+        let _ = self.executor.write_file(&path, &content).await;
+        let preview: String = content.chars().take(crate::tools::MAX_OUTPUT_BYTES / 2).collect();
+        format!(
+            "{preview}\n\n[{} bytes total, truncated. \
+             Full output saved to {path} — use the read tool to fetch more.]",
+            content.len()
+        )
+    }
+
     async fn e2b_bash(&self, inv: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError> {
         let cmd = req_str(&inv, "command")?;
         let timeout_ms = inv.input.get("timeout_ms")
@@ -613,16 +630,20 @@ impl E2bToolRuntime {
                 },
                 attachments: vec![],
             }),
-            Ok(r) => Ok(ToolOutcome {
-                output: Ok(json!({
-                    "command": cmd,
-                    "stdout": truncate(r.stdout),
-                    "stderr": truncate(r.stderr),
-                    "exit_code": r.exit_code,
-                    "success": r.exit_code == 0,
-                })),
-                attachments: vec![],
-            }),
+            Ok(r) => {
+                let stdout = self.bound_output(r.stdout, &inv.id, "stdout").await;
+                let stderr = self.bound_output(r.stderr, &inv.id, "stderr").await;
+                Ok(ToolOutcome {
+                    output: Ok(json!({
+                        "command": cmd,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "exit_code": r.exit_code,
+                        "success": r.exit_code == 0,
+                    })),
+                    attachments: vec![],
+                })
+            }
         }
     }
 
@@ -821,26 +842,26 @@ impl E2bToolRuntime {
                     truncate(format!("grep error: {}", r.stderr)))),
                 attachments: vec![],
             }),
-            Ok(r) => Ok(ToolOutcome {
-                output: Ok(json!({
-                    "pattern": pattern,
-                    "matches": truncate(r.stdout),
-                })),
-                attachments: vec![],
-            }),
+            Ok(r) => {
+                let matches = self.bound_output(r.stdout, &inv.id, "matches").await;
+                Ok(ToolOutcome {
+                    output: Ok(json!({
+                        "pattern": pattern,
+                        "matches": matches,
+                    })),
+                    attachments: vec![],
+                })
+            }
         }
     }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-const MAX_TOOL_CHARS: usize = 60_000;
-
 fn truncate(s: String) -> String {
-    let n = s.chars().count();
-    if n <= MAX_TOOL_CHARS { return s; }
-    let kept: String = s.chars().take(MAX_TOOL_CHARS).collect();
-    format!("{kept}\n\n[output truncated: {n} chars, showing first {MAX_TOOL_CHARS}]")
+    if s.len() <= crate::tools::MAX_OUTPUT_BYTES { return s; }
+    let kept: String = s.chars().take(crate::tools::MAX_OUTPUT_BYTES).collect();
+    format!("{kept}\n\n[content truncated: use offset/limit to read more]")
 }
 
 fn resolve(cwd: &str, path: &str) -> String {
