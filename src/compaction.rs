@@ -4,9 +4,9 @@
 //! eventually exceeds the model's context window. Without intervention
 //! the next turn either truncates server-side (silently losing context)
 //! or fails with a 400 / `context_length_exceeded`. Compaction folds the
-//! mid-conversation into a single `<conversation-summary>` block while
-//! preserving a tail of recent messages verbatim — same idea as OMA
-//! `compaction.ts` and Claude Code's `/compact`.
+//! mid-conversation into a `<conversation-summary>` checkpoint while
+//! preserving all true user messages verbatim within a token budget —
+//! same idea as Codex local compaction.
 //!
 //! Strategy contract (`CompactionStrategy`):
 //!   * `should_compact` — pure boolean gate; the agent loop checks this
@@ -34,13 +34,13 @@ use crate::model::{
 use crate::tools::ToolSpec;
 
 /// Fraction of the model's context window above which compaction fires.
-/// 0.75 mirrors OMA's `TRIGGER_FRACTION` — leaves a ~25 % headroom for
-/// the in-flight turn's own tool results and the model's reply.
-pub const DEFAULT_TRIGGER_FRACTION: f64 = 0.75;
+/// 0.90 leaves a ~10 % headroom for the in-flight turn's tool results and
+/// the model's reply, matching Codex's default threshold.
+pub const DEFAULT_TRIGGER_FRACTION: f64 = 0.90;
 
-/// Floor on how many of the most recent messages compaction MUST keep
-/// verbatim alongside the summary. Below this, a turn can't make
-/// meaningful progress (one user + one assistant minimum).
+/// Minimum number of messages the history must contain before compaction
+/// is allowed to run. Below this floor the history is too short to benefit
+/// from compaction and the call is a no-op.
 pub const DEFAULT_TAIL_MIN_MESSAGES: usize = 4;
 
 /// Soft cap on summary length when serialised back into a `User`
@@ -48,6 +48,12 @@ pub const DEFAULT_TAIL_MIN_MESSAGES: usize = 4;
 /// but pass `max_tokens` hint so it doesn't ramble. 2 000 ≈ 8 KB —
 /// enough for most multi-turn dialogues; OMA uses the same default.
 pub const DEFAULT_SUMMARY_MAX_TOKENS: i32 = 2_000;
+
+/// Token budget for verbatim user-message retention in the replacement
+/// history. All true user messages are collected from the full history
+/// (oldest to newest) and as many as fit within this budget are kept
+/// verbatim — newest first. Matches Codex's `COMPACT_USER_MESSAGE_MAX_TOKENS`.
+pub const DEFAULT_USER_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
 
 /// Mixed-script token estimator:
 /// ASCII runs compress at ~4 chars/token, while CJK and other non-ASCII
@@ -192,24 +198,28 @@ pub trait CompactionStrategy: Send + Sync {
     ) -> Result<CompactionOutcome, CompactionError>;
 }
 
-/// CC-style strategy: send the FULL conversation back to the model with
-/// a "summarize" user message appended, parse the reply as the summary,
-/// and rebuild history as `[synthetic user with summary, ...tail]`.
+/// Codex-style local compaction: send the full history to the model with a
+/// handoff-summary prompt appended, collect the reply as a checkpoint, then
+/// rebuild history as `[...retained user messages, summary]`.
 ///
-/// Why this shape:
-///   * Reusing the same model client keeps the prefix cache-hot on
-///     Anthropic (the messages prefix is identical to the main agent's
-///     last call modulo the summarize suffix).
-///   * Keeping a tail of N recent messages verbatim preserves
-///     fine-grained tool-call context the summary inevitably loses.
-///   * The summary lives as a regular `User` message (wrapped in
-///     `<conversation-summary>` tags) so downstream wire renderers
-///     don't need a special block type.
+/// Design rationale:
+///   * User messages are preserved verbatim (up to `user_message_token_budget`)
+///     because they carry precise constraints and goals that paraphrasing loses.
+///   * Assistant / tool messages are folded into the summary — they are large
+///     but low-density and tolerate lossy compression.
+///   * The summary is placed LAST so the model reads it as the most recent
+///     context rather than as background preamble.
+///   * Reusing the same model client keeps the Anthropic prompt-cache prefix
+///     hot (identical system + tools on every call).
 pub struct SummarizeCompactionStrategy {
     pub trigger_fraction: f64,
+    /// Minimum total message count below which compaction is skipped.
+    /// Does not control retention; use `user_message_token_budget` for that.
     pub tail_min_messages: usize,
     pub summary_max_tokens: i32,
     pub summary_prompt: String,
+    /// Token budget for verbatim user-message retention in the replacement history.
+    pub user_message_token_budget: u64,
 }
 
 impl Default for SummarizeCompactionStrategy {
@@ -219,6 +229,7 @@ impl Default for SummarizeCompactionStrategy {
             tail_min_messages: DEFAULT_TAIL_MIN_MESSAGES,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
             summary_prompt: DEFAULT_SUMMARY_PROMPT.into(),
+            user_message_token_budget: DEFAULT_USER_MESSAGE_TOKEN_BUDGET,
         }
     }
 }
@@ -238,18 +249,25 @@ impl SummarizeCompactionStrategy {
         self.summary_max_tokens = n;
         self
     }
+
+    pub fn with_user_message_token_budget(mut self, budget: u64) -> Self {
+        self.user_message_token_budget = budget;
+        self
+    }
 }
 
-/// Default summarize instruction. Asks for preservation of the load-
-/// bearing facts (decisions, file paths, tool outputs, in-flight tasks,
-/// next steps) so the agent can resume coherently. Mirrors the spirit
-/// of OMA `compaction.ts:DEFAULT_SUMMARIZE_PROMPT` but rewritten to
-/// avoid the existing "<conversation-summary>" tag the agent might
-/// echo back in its summary (we add the tag externally).
-pub const DEFAULT_SUMMARY_PROMPT: &str = "Produce a concise summary of the conversation above. \
-    Preserve: key decisions, file paths, command outputs, in-flight tasks, and explicit \
-    next steps. If a prior <conversation-summary> block exists in this conversation, \
-    produce an UPDATED summary that supersedes it (incorporating new activity since). \
+/// Handoff-oriented summarise prompt. Instructs the model to produce a
+/// structured checkpoint for *another agent instance* to resume from —
+/// not a human-readable recap. Mirrors Codex's `SUMMARIZATION_PROMPT`.
+pub const DEFAULT_SUMMARY_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. \
+    Create a handoff summary for another agent instance that will resume this task.\n\n\
+    Include:\n\
+    - Current progress and key decisions made\n\
+    - Important context, constraints, or user preferences that must be respected\n\
+    - What remains to be done (clear next steps)\n\
+    - Any critical data, file paths, command outputs, or references needed to continue\n\n\
+    If a prior <conversation-summary> block exists in this conversation, produce an UPDATED \
+    summary that supersedes it (incorporating all activity since). \
     Output only the summary text — no preamble, no closing remarks.";
 
 #[async_trait]
@@ -316,35 +334,24 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
             return Err(CompactionError::EmptySummary);
         }
 
-        // Tail preservation: keep the last N messages verbatim. We snip
-        // off the head and replace it with a synthetic User block that
-        // wraps the model's summary in `<conversation-summary>` tags
-        // so the model recognises it as platform-injected context.
-        let total = messages.len();
-        let tail_count = self.tail_min_messages.min(total);
-        let mut tail_start = total - tail_count;
-        // Align tail to start on a User message — Anthropic / OpenAI
-        // both expect the first non-summary message to be user-role.
-        while tail_start < total && !matches!(messages[tail_start], ChatMessage::User { .. }) {
-            tail_start += 1;
-        }
-        let tail: Vec<ChatMessage> = if tail_start < total {
-            messages[tail_start..].to_vec()
-        } else {
-            // No user message in the tail window — shouldn't happen in
-            // practice (a turn always starts with user) but cheap to
-            // guard. Skip compaction in this case. `usage` was already
-            // spent on the (now-discarded) summary call — surface it
-            // anyway so HR can see the cost.
+        // Collect all true user messages from history, skipping prior summary
+        // messages (they are superseded by the new checkpoint we just generated).
+        let user_texts = collect_user_message_texts(&messages);
+        if user_texts.is_empty() {
+            // No real user messages to retain — skip installing the summary.
+            // Surface usage so HR can account for the (now-discarded) model call.
             return Ok(CompactionOutcome { messages, usage });
-        };
+        }
 
-        let mut out = Vec::with_capacity(tail.len() + 1);
-        out.push(ChatMessage::User {
-            content: serialize_summary(&summary_text),
-            attachments: vec![],
-        });
-        out.extend(tail);
+        // Build replacement history: retained user messages first, summary last.
+        // User messages are selected newest-first within the token budget then
+        // reversed to chronological order. Placing the summary last means the
+        // model reads the most recent context at the end of the prompt.
+        let out = build_compacted_history(
+            &user_texts,
+            &summary_text,
+            self.user_message_token_budget,
+        );
         Ok(CompactionOutcome {
             messages: out,
             usage,
@@ -353,12 +360,96 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
 }
 
 fn serialize_summary(summary: &str) -> String {
-    // Tag-wrap so the next turn's model treats this as injected context
-    // and not a fresh user instruction. Anthropic / OpenAI both train
-    // on similar markers; the exact tag matches OMA's `<conversation-
-    // summary>` convention so anyone reading both codebases doesn't
-    // double-take.
     format!("<conversation-summary>\n{summary}\n</conversation-summary>")
+}
+
+/// Collect the text of every real `User` message in `messages`, in order,
+/// filtering out prior summary messages. Prior summaries are superseded by
+/// the new checkpoint and must not be recycled into the replacement history.
+fn collect_user_message_texts(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            ChatMessage::User { content, .. } if !is_summary_message(content) => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_summary_message(content: &str) -> bool {
+    content.trim_start().starts_with("<conversation-summary>")
+}
+
+/// Build the replacement history: retained user messages (chronological order)
+/// followed by the summary as the final message.
+///
+/// `user_texts` is the full list of real user messages oldest→newest.
+/// Messages are selected newest-first within `token_budget`; if the oldest
+/// selected message only partially fits, it is truncated rather than dropped.
+fn build_compacted_history(
+    user_texts: &[String],
+    summary_text: &str,
+    token_budget: u64,
+) -> Vec<ChatMessage> {
+    let mut selected: Vec<String> = Vec::new();
+    let mut remaining = token_budget;
+    for text in user_texts.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let tokens = estimate_tokens(text);
+        if tokens <= remaining {
+            selected.push(text.clone());
+            remaining -= tokens;
+        } else {
+            // Partially fits: truncate rather than skip so the budget is not
+            // wasted and the oldest retained message still carries context.
+            selected.push(truncate_to_token_budget(text, remaining));
+            break;
+        }
+    }
+    selected.reverse(); // restore chronological order
+    let mut out = Vec::with_capacity(selected.len() + 1);
+    for text in selected {
+        out.push(ChatMessage::User {
+            content: text,
+            attachments: vec![],
+        });
+    }
+    // Summary goes last — the model reads this as the most recent context.
+    out.push(ChatMessage::User {
+        content: serialize_summary(summary_text),
+        attachments: vec![],
+    });
+    out
+}
+
+/// Truncate `s` to at most `budget` estimated tokens using the same
+/// mixed-script estimator as `estimate_tokens`. Cuts at the last complete
+/// character that keeps the running estimate within `budget`.
+fn truncate_to_token_budget(s: &str, budget: u64) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let mut ascii: u64 = 0;
+    let mut non_ascii: u64 = 0;
+    let mut end = 0usize;
+    for (byte_pos, c) in s.char_indices() {
+        let (na, nn) = if c.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        };
+        if na.div_ceil(4) + nn > budget {
+            break;
+        }
+        ascii = na;
+        non_ascii = nn;
+        end = byte_pos + c.len_utf8();
+    }
+    s[..end].to_string()
 }
 
 #[cfg(test)]
@@ -498,8 +589,9 @@ mod tests {
     #[test]
     fn should_compact_fires_when_above_threshold() {
         let strat = SummarizeCompactionStrategy::default();
-        // 5 messages * 8000 chars each ≈ 10K tokens, with a 12K window
-        // that's well above 75 % (= 9K threshold).
+        // 5 messages * 8000 ASCII chars each ≈ 10K tokens.
+        // With an 11K window the 90% threshold is 9 900 tokens, so
+        // 10K tokens exceeds it and compaction must fire.
         let messages = vec![
             user(&"x".repeat(8000)),
             assistant_text(&"y".repeat(8000)),
@@ -507,7 +599,7 @@ mod tests {
             assistant_text(&"y".repeat(8000)),
             user(&"x".repeat(8000)),
         ];
-        assert!(strat.should_compact(&messages, 12_000));
+        assert!(strat.should_compact(&messages, 11_000));
     }
 
     #[test]
@@ -542,17 +634,27 @@ mod tests {
         ];
         let outcome = strat.compact(messages, &ctx).await.unwrap();
         let out = outcome.messages;
-        // First message is the synthetic summary user message; the rest
-        // is the preserved tail (last 2 messages, aligned to user start).
-        assert!(
-            matches!(&out[0], ChatMessage::User { content, .. } if content.contains("<conversation-summary>") && content.contains("we ran ls and grep"))
-        );
-        // Tail aligned to start on a User message (the "third user").
-        match &out[1] {
-            ChatMessage::User { content, .. } => assert_eq!(content, "third user"),
-            other => panic!("expected User in tail, got {other:?}"),
+        // All three real user messages fit within the 20 000-token budget and
+        // are retained verbatim. The summary is appended as the final message.
+        assert_eq!(out.len(), 4, "3 user messages + 1 summary");
+        match &out[0] {
+            ChatMessage::User { content, .. } => assert_eq!(content, "first user"),
+            other => panic!("expected User at [0], got {other:?}"),
         }
-        // Output is much shorter than input.
+        match &out[1] {
+            ChatMessage::User { content, .. } => assert_eq!(content, "second user"),
+            other => panic!("expected User at [1], got {other:?}"),
+        }
+        match &out[2] {
+            ChatMessage::User { content, .. } => assert_eq!(content, "third user"),
+            other => panic!("expected User at [2], got {other:?}"),
+        }
+        // Summary is the last message.
+        assert!(
+            matches!(&out[3], ChatMessage::User { content, .. }
+                if content.contains("<conversation-summary>") && content.contains("we ran ls and grep"))
+        );
+        // Output is shorter than input (6 messages → 4).
         assert!(out.len() < 6);
         // FixedSummaryClient doesn't report usage → outcome.usage is None.
         assert!(outcome.usage.is_none());
