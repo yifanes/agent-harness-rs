@@ -41,7 +41,10 @@ let tools = LocalToolRuntime::new(LocalToolConfig {
 });
 
 let model = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
-    base_url: "https://api.openai.com".into(),
+    // Full API prefix INCLUDING the version segment. The client appends only
+    // `/chat/completions`. For other OpenAI-compatible providers use their own
+    // prefix, e.g. GLM: "https://open.bigmodel.cn/api/paas/v4".
+    base_url: "https://api.openai.com/v1".into(),
     api_key: std::env::var("OPENAI_API_KEY").unwrap(),
     model: "gpt-4o".into(),
     ..Default::default()

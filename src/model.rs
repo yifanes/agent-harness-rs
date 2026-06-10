@@ -446,13 +446,17 @@ impl OpenAiCompatibleModelClient {
     }
 
     fn endpoint(&self) -> String {
-        format!(
-            "{}/v1/chat/completions",
-            self.config
-                .base_url
-                .trim_end_matches('/')
-                .trim_end_matches("/v1")
-        )
+        // `base_url` is the full API prefix supplied by the caller, including
+        // any version segment — e.g. `https://api.openai.com/v1` or
+        // `https://open.bigmodel.cn/api/paas/v4`. We only append the route;
+        // picking the version is the caller's responsibility, since it differs
+        // across OpenAI-compatible providers.
+        let base = self.config.base_url.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else {
+            format!("{base}/chat/completions")
+        }
     }
 
     fn request_body(&self, input: &ModelTurnInput) -> Value {
@@ -1243,13 +1247,15 @@ impl AnthropicModelClient {
     }
 
     fn endpoint(&self) -> String {
-        format!(
-            "{}/v1/messages",
-            self.config
-                .base_url
-                .trim_end_matches('/')
-                .trim_end_matches("/v1")
-        )
+        // `base_url` is the full API prefix supplied by the caller, including
+        // the version segment — e.g. `https://api.anthropic.com/v1`. We only
+        // append the route; picking the version is the caller's job.
+        let base = self.config.base_url.trim_end_matches('/');
+        if base.ends_with("/messages") {
+            base.to_string()
+        } else {
+            format!("{base}/messages")
+        }
     }
 
     /// Build the JSON body for `POST /v1/messages`. Mirrors `OpenAi`'s
@@ -1969,8 +1975,10 @@ mod tests {
 
     #[test]
     fn openai_client_builds_chat_completions_request() {
+        // base_url is the full prefix: the route is appended verbatim, the
+        // version segment is NOT injected — a trailing slash is tolerated.
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
-            base_url: "https://example.test/".into(),
+            base_url: "https://example.test/v1/".into(),
             api_key: "sk-test".into(),
             model: "gpt-test".into(),
             temperature: None,
@@ -1992,6 +2000,20 @@ mod tests {
         assert_eq!(
             client_with_v1.endpoint(),
             "https://example.test/v1/chat/completions"
+        );
+        // Providers whose version segment is not `/v1` (e.g. GLM's `/v4`) are
+        // honored verbatim — regression guard for the `/v1`-injection bug.
+        let glm = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
+            base_url: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
+            api_key: "sk-test".into(),
+            model: "glm-4.6".into(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        });
+        assert_eq!(
+            glm.endpoint(),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
         );
         let body = client.request_body(&user("hello"));
         assert_eq!(body["model"], "gpt-test");
