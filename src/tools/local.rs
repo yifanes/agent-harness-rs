@@ -524,28 +524,24 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
 
 // ── output cap ────────────────────────────────────────────────────────────────
 
-/// Write `content` to `/tmp/harness_out_{id}_{suffix}.txt` and return a
-/// preview with the path. Used for bash stdout/stderr and grep matches.
+/// Write `content` to `/tmp/harness_out_{id}_{suffix}.txt` and return an
+/// error-aware head+tail preview with the path. Used for bash stdout/stderr
+/// and grep matches. Spills only when over budget (see `bounded_preview`).
 fn bound_output(content: String, id: &str, suffix: &str) -> String {
-    if content.len() <= crate::tools::MAX_OUTPUT_BYTES {
-        return content;
-    }
     let path = format!("/tmp/harness_out_{id}_{suffix}.txt");
-    let _ = std::fs::write(&path, &content);
-    let preview: String = content.chars().take(crate::tools::MAX_OUTPUT_BYTES / 2).collect();
-    format!(
-        "{preview}\n\n[{} bytes total, truncated. \
-         Full output saved to {path} — use the read tool to fetch more.]",
-        content.len()
-    )
+    match crate::tools::bounded_preview(&content, &path) {
+        None => content,
+        Some(preview) => {
+            let _ = std::fs::write(&path, &content);
+            preview
+        }
+    }
 }
 
 /// Simple safety truncation used only by the read tool as a backstop for
 /// pages that exceed the output budget after pagination.
 fn truncate(s: String) -> String {
-    if s.len() <= crate::tools::MAX_OUTPUT_BYTES { return s; }
-    let kept: String = s.chars().take(crate::tools::MAX_OUTPUT_BYTES).collect();
-    format!("{kept}\n\n[content truncated: use offset/limit to read more]")
+    crate::tools::clip_head(s)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

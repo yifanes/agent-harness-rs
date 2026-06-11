@@ -882,12 +882,176 @@ fn join_path(parent: &str, key: &str) -> String {
     }
 }
 
+// ───────────────────────── lightweight schema validation ─────────────────────────
+
+/// Lightweight, best-effort validation of `input` against a tool's
+/// `input_schema`. Deliberately NOT a full JSON Schema validator (no extra
+/// dependency): it checks only the two failure modes weak models hit most —
+/// (1) a `required` field is missing or null (when null isn't allowed), and
+/// (2) a present field's top-level JSON type contradicts the schema's
+/// declared `type`. Returns `Ok(())` when no such violation is found (so
+/// unmodeled constraints like enums / patterns pass through), or the first
+/// violation as a human-readable string for a teaching error.
+///
+/// Runs at dispatch time AFTER [`repair_tool_input_for_spec`], so anything
+/// the repair pass can fix never reaches here. A non-object schema or input
+/// is treated as un-validatable and passes.
+pub fn validate_against_schema(schema: &Value, input: &Value) -> Result<(), String> {
+    let (Some(_), Some(obj)) = (schema.as_object(), input.as_object()) else {
+        return Ok(());
+    };
+    for field in required_set(schema.get("required")) {
+        let prop = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get(&field));
+        let allows_null = prop.is_some_and(type_allows_null);
+        match obj.get(&field) {
+            None => return Err(format!("missing required field `{field}`")),
+            Some(Value::Null) if !allows_null => {
+                return Err(format!("required field `{field}` must not be null"))
+            }
+            _ => {}
+        }
+    }
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (key, value) in obj {
+        let Some(prop) = props.get(key) else { continue };
+        let expected = schema_type(prop);
+        if expected.is_empty() || (value.is_null() && type_allows_null(prop)) {
+            continue;
+        }
+        if !json_value_matches_type(value, &expected) {
+            return Err(format!(
+                "field `{key}` should be {expected}, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `value`'s JSON type satisfy the schema `type` string? `integer`
+/// accepts whole-valued numbers; `number` accepts any number.
+fn json_value_matches_type(value: &Value, expected: &str) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => is_json_integer(value),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// Synthesize a minimal valid example object from a tool's `input_schema`:
+/// each required field (or every property when none are required) mapped to
+/// a type-appropriate placeholder. Used to make invalid-argument errors
+/// teaching: the model sees the shape it should have produced.
+pub fn example_for_schema(schema: &Value) -> Value {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Value::Object(Map::new());
+    };
+    let required = required_set(schema.get("required"));
+    let keys: Vec<&String> = if required.is_empty() {
+        props.keys().collect()
+    } else {
+        required.iter().filter(|k| props.contains_key(*k)).collect()
+    };
+    let mut out = Map::new();
+    for key in keys {
+        if let Some(prop) = props.get(key) {
+            out.insert(key.clone(), placeholder_for_schema(prop));
+        }
+    }
+    Value::Object(out)
+}
+
+fn placeholder_for_schema(prop: &Value) -> Value {
+    match schema_type(prop).as_str() {
+        "string" => Value::String("<string>".into()),
+        "integer" | "number" => Value::from(0),
+        "boolean" => Value::Bool(false),
+        "array" => {
+            let item = schema_array_items_type(prop)
+                .map(|t| placeholder_for_schema(&serde_json::json!({ "type": t })))
+                .unwrap_or(Value::String("<item>".into()));
+            Value::Array(vec![item])
+        }
+        "object" => Value::Object(Map::new()),
+        _ => Value::String("<value>".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     // ── truncation repair ──
+
+    // ── schema validation & example synthesis ──
+
+    fn validate_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "limit": { "type": "integer" },
+                "flag": { "type": "boolean" },
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_input() {
+        assert!(validate_against_schema(&validate_schema(), &json!({"path": "a", "limit": 3})).is_ok());
+    }
+
+    #[test]
+    fn validate_flags_missing_required() {
+        let err = validate_against_schema(&validate_schema(), &json!({"limit": 3})).unwrap_err();
+        assert!(err.contains("path"), "{err}");
+    }
+
+    #[test]
+    fn validate_flags_wrong_type() {
+        let err =
+            validate_against_schema(&validate_schema(), &json!({"path": "a", "limit": "nope"}))
+                .unwrap_err();
+        assert!(err.contains("limit") && err.contains("integer"), "{err}");
+    }
+
+    #[test]
+    fn validate_flags_null_required() {
+        let err = validate_against_schema(&validate_schema(), &json!({"path": null})).unwrap_err();
+        assert!(err.contains("path") && err.contains("null"), "{err}");
+    }
+
+    #[test]
+    fn example_uses_required_fields_with_typed_placeholders() {
+        let ex = example_for_schema(&validate_schema());
+        assert_eq!(ex["path"], json!("<string>"));
+        // Only required fields appear when `required` is non-empty.
+        assert!(ex.get("limit").is_none());
+    }
+
+    #[test]
+    fn example_falls_back_to_all_properties_when_none_required() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": { "type": "integer" }, "b": { "type": "boolean" } }
+        });
+        let ex = example_for_schema(&schema);
+        assert_eq!(ex["a"], json!(0));
+        assert_eq!(ex["b"], json!(false));
+    }
 
     #[test]
     fn truncation_closes_truncated_json() {

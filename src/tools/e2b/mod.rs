@@ -322,18 +322,21 @@ impl E2bExecutor {
                 if let Some(err) = parse_unary_error(&bytes) { return Err(err.into()); }
                 return Err(E2bError::Protocol(format!("{method_owned} HTTP {status}")));
             }
+            // All response bytes are already buffered, so a single decode step
+            // is decisive: the first envelope is either the unary Data payload
+            // or a terminal end-of-stream/None. (Decoder envelopes are
+            // exhaustively matched, so there is nothing to loop over.)
             let mut dec = EnvelopeDecoder::new();
             dec.push(&bytes);
-            loop {
-                match dec.try_next() {
-                    Ok(None) | Ok(Some(Envelope::EndOfStream(_))) => break,
-                    Ok(Some(Envelope::Data(p))) => {
-                        return Resp::decode(&p[..]).map_err(|e| E2bError::Protocol(format!("decode resp: {e}")));
-                    }
-                    Err(e) => return Err(E2bError::Protocol(format!("envelope: {e}"))),
+            match dec.try_next() {
+                Ok(Some(Envelope::Data(p))) => {
+                    Resp::decode(&p[..]).map_err(|e| E2bError::Protocol(format!("decode resp: {e}")))
                 }
+                Ok(None) | Ok(Some(Envelope::EndOfStream(_))) => {
+                    Err(E2bError::Protocol("no response message".into()))
+                }
+                Err(e) => Err(E2bError::Protocol(format!("envelope: {e}"))),
             }
-            Err(E2bError::Protocol("no response message".into()))
         });
         Ok((req_tx, handle))
     }

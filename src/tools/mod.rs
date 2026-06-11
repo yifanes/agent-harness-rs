@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod bounded;
 pub mod sandbox;
 
 #[cfg(feature = "local-tools")]
@@ -77,14 +78,24 @@ impl std::fmt::Display for ToolFailure {
     }
 }
 
-pub fn invalid_input_failure(tool: &str, message: impl AsRef<str>, input: &Value) -> ToolFailure {
+pub fn invalid_input_failure(
+    tool: &str,
+    message: impl AsRef<str>,
+    input: &Value,
+    schema: Option<&Value>,
+) -> ToolFailure {
     ToolFailure::new(
         ToolFailureKind::InvalidInput,
-        format_invalid_input_message(tool, message.as_ref(), input),
+        format_invalid_input_message(tool, message.as_ref(), input, schema),
     )
 }
 
-pub fn format_invalid_input_message(tool: &str, detail: &str, input: &Value) -> String {
+pub fn format_invalid_input_message(
+    tool: &str,
+    detail: &str,
+    input: &Value,
+    schema: Option<&Value>,
+) -> String {
     let received = received_fields(input);
     let summaries = summarize_input_fields(input);
     let mut message = format!(
@@ -96,6 +107,14 @@ Please rewrite the input so it satisfies the expected schema."
     }
     if !summaries.is_empty() {
         message.push_str(&format!(" Field summary: {}.", summaries.join("; ")));
+    }
+    // Teaching: show a minimal valid example synthesized from the schema so
+    // the model sees the exact shape it should have produced.
+    if let Some(schema) = schema {
+        let example = crate::tool_repair::example_for_schema(schema);
+        if example.as_object().is_some_and(|o| !o.is_empty()) {
+            message.push_str(&format!(" Expected shape: {example}."));
+        }
     }
     message
 }
@@ -166,6 +185,21 @@ pub enum ToolRuntimeError {
 #[async_trait]
 pub trait ToolRuntime: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
+
+    /// Apply schema-guided input repair in place, returning the repairs made
+    /// (or `None` when the input is already clean / no schema matches).
+    ///
+    /// The default is a no-op; [`bounded::BoundedToolRuntime`] overrides it as
+    /// the single source of truth for repair. `agent_loop` calls this BEFORE
+    /// recording the invocation in history / events so the recorded arguments
+    /// match what the runtime ultimately executes; the wrapper re-applies it
+    /// during dispatch (idempotent) to also cover bypass callers.
+    fn repair_invocation(
+        &self,
+        _invocation: &mut ToolInvocation,
+    ) -> Option<Vec<crate::tool_repair::ToolInputRepair>> {
+        None
+    }
 
     async fn invoke(&self, invocation: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError>;
 
@@ -289,11 +323,10 @@ impl ToolRuntime for MockToolRuntime {
                     Err(e) => {
                         let message = match e {
                             EditSearchError::NotFound => {
-                                format!("Could not find old_string in the file. It must match exactly, including whitespace and indentation. Read the file again before retrying.")
+                                "Could not find old_string in the file. It must match exactly, including whitespace and indentation. Read the file again before retrying.".to_string()
                             }
-                            EditSearchError::EscapedNotFound => format!(
-                                "Could not find old_string in the file, even after checking for JSON-escaped text. It must match exactly, including whitespace and indentation. Read the file again before retrying."
-                            ),
+                            EditSearchError::EscapedNotFound =>
+                                "Could not find old_string in the file, even after checking for JSON-escaped text. It must match exactly, including whitespace and indentation. Read the file again before retrying.".to_string(),
                             EditSearchError::Ambiguous { occurrences } => format!(
                                 "Found {occurrences} exact matches for old_string. Provide more surrounding context or set replace_all=true."
                             ),
@@ -314,14 +347,19 @@ impl ToolRuntime for MockToolRuntime {
                 };
                 let replaced = if replace_all { resolved.occurrences } else { 1 };
                 files.insert(path.clone(), next);
-                let mut result = json!({"path": path, "replaced": replaced});
+                // Repair is silent: a successful edit reports only the result.
+                // The json-escape rescue is recorded for tracing, never
+                // surfaced to the model (MiMoCode "success silent" policy).
                 if let Some(repair) = resolved.repair {
-                    // Surface the repair to the model so it learns the
-                    // arguments were literal-escaped.
-                    result["repair"] = json!(repair);
+                    tracing::debug!(
+                        target: "harness::tool_repair",
+                        tool = "edit",
+                        repair,
+                        "edit applied after silent json-escape repair"
+                    );
                 }
                 Ok(ToolOutcome {
-                    output: Ok(result),
+                    output: Ok(json!({"path": path, "replaced": replaced})),
                     attachments: vec![],
                 })
             }
@@ -665,6 +703,138 @@ pub const MAX_FS_GLOB_RESULTS: usize = 2000;
 /// path so the model can fetch the rest with the read tool if needed.
 pub const MAX_OUTPUT_BYTES: usize = 50_000;
 
+/// Tail bytes scanned for an error signature when bounding output. If the
+/// failure the model needs is in the last chunk, head-only truncation would
+/// drop it — so we detect it and keep a tail slice instead.
+const TAIL_SCAN_BYTES: usize = 2048;
+
+/// Case-insensitive substrings that mark a line worth preserving in the tail
+/// of a truncated output (mirrors MiMoCode's truncation heuristic).
+const ERROR_MARKERS: &[&str] = &[
+    "error",
+    "exception",
+    "failed",
+    "fatal",
+    "panic",
+    "traceback",
+    "exit code",
+];
+
+/// Compute the preview for an over-budget tool output. Returns `None` when
+/// `full` fits within [`MAX_OUTPUT_BYTES`] (caller uses it unchanged, no
+/// spill). Otherwise returns a preview the caller should surface AFTER
+/// writing `full` to `spill_path`:
+/// * if the tail carries an error signature, keep head (70% budget) AND tail
+///   (30%) so the failure survives the cut;
+/// * else keep head only.
+///
+/// The preview ends with a hint pointing at the spilled file.
+pub fn bounded_preview(full: &str, spill_path: &str) -> Option<String> {
+    if full.len() <= MAX_OUTPUT_BYTES {
+        return None;
+    }
+    Some(format!(
+        "{}\n\n[{} bytes total, truncated. Full output saved to {spill_path} — \
+use the read tool with offset/limit to fetch more.]",
+        head_tail_body(full),
+        full.len()
+    ))
+}
+
+/// Error-aware head+tail clip for outputs that have NO spill file but blew
+/// past a hard ceiling — the catch-all in [`bounded::BoundedToolRuntime`] for
+/// tools (MCP, custom) that don't self-bound. Always returns a bounded
+/// string with a note (no file reference).
+pub fn clip_overflow(full: &str) -> String {
+    format!(
+        "{}\n\n[output clipped: {} bytes total exceeded the tool-output ceiling]",
+        head_tail_body(full),
+        full.len()
+    )
+}
+
+/// Build the truncated body (no surrounding note): head+tail when the tail
+/// carries an error signature so the failure survives, else head only.
+fn head_tail_body(full: &str) -> String {
+    let lines: Vec<&str> = full.split('\n').collect();
+    if tail_has_error(full) {
+        let head_budget = MAX_OUTPUT_BYTES * 7 / 10;
+        let head = take_lines_head(&lines, head_budget);
+        let tail = take_lines_tail(&lines, MAX_OUTPUT_BYTES - head_budget);
+        let omitted = lines
+            .len()
+            .saturating_sub(head.len())
+            .saturating_sub(tail.len());
+        format!(
+            "{}\n\n... {omitted} lines omitted — showing head and tail ...\n\n{}",
+            head.join("\n"),
+            tail.join("\n"),
+        )
+    } else {
+        take_lines_head(&lines, MAX_OUTPUT_BYTES).join("\n")
+    }
+}
+
+/// Head-only clip with a note, for outputs that have NO spill file (read
+/// `content`, grep error text). Returns the string unchanged when within
+/// budget; otherwise clips at a char boundary near [`MAX_OUTPUT_BYTES`].
+pub fn clip_head(s: String) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s;
+    }
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[content truncated: use offset/limit to read more]",
+        &s[..end]
+    )
+}
+
+/// Does the last [`TAIL_SCAN_BYTES`] of `s` contain an error marker?
+fn tail_has_error(s: &str) -> bool {
+    let mut start = s.len().saturating_sub(TAIL_SCAN_BYTES);
+    while start > 0 && !s.is_char_boundary(start) {
+        start -= 1;
+    }
+    let scan = s[start..].to_ascii_lowercase();
+    ERROR_MARKERS.iter().any(|m| scan.contains(m))
+}
+
+/// Collect whole lines from the front until adding the next would exceed
+/// `budget` bytes (counting the rejoining `\n`).
+fn take_lines_head<'a>(lines: &[&'a str], budget: usize) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let cost = line.len() + usize::from(i > 0);
+        if used + cost > budget {
+            break;
+        }
+        out.push(*line);
+        used += cost;
+    }
+    out
+}
+
+/// Collect whole lines from the back until adding the next would exceed
+/// `budget` bytes; returned in original order.
+fn take_lines_tail<'a>(lines: &[&'a str], budget: usize) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let cost = line.len() + usize::from(!out.is_empty());
+        if used + cost > budget {
+            break;
+        }
+        out.push(*line);
+        used += cost;
+    }
+    out.reverse();
+    out
+}
+
 /// Walk `base_dir` recursively and return relative paths that match `pattern`.
 /// Skips hidden directories (`.git`, `.DS_Store`, etc.) unless the pattern
 /// explicitly starts with `.`, prunes dependency / build directories
@@ -910,6 +1080,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_preview_none_when_within_budget() {
+        assert!(bounded_preview("short output", "/tmp/x.txt").is_none());
+    }
+
+    #[test]
+    fn bounded_preview_head_only_drops_tail_without_error() {
+        let mut s = String::from("HEAD_MARKER\n");
+        // ~60KB of innocuous lines, no error markers anywhere.
+        while s.len() < MAX_OUTPUT_BYTES + 10_000 {
+            s.push_str("padding line of plain text\n");
+        }
+        s.push_str("LAST_LINE_NO_MARKER");
+        let preview = bounded_preview(&s, "/tmp/out.txt").expect("over budget");
+        assert!(preview.contains("HEAD_MARKER"));
+        assert!(!preview.contains("LAST_LINE_NO_MARKER"), "tail leaked in head-only mode");
+        assert!(preview.contains("/tmp/out.txt"));
+        assert!(preview.contains("truncated"));
+    }
+
+    #[test]
+    fn bounded_preview_preserves_error_in_tail() {
+        let mut s = String::from("HEAD_MARKER\n");
+        while s.len() < MAX_OUTPUT_BYTES + 10_000 {
+            s.push_str("padding line of plain text\n");
+        }
+        s.push_str("ERROR: the build failed at the end");
+        let preview = bounded_preview(&s, "/tmp/out.txt").expect("over budget");
+        // Head+tail mode: both the head AND the trailing error survive.
+        assert!(preview.contains("HEAD_MARKER"));
+        assert!(preview.contains("ERROR: the build failed at the end"));
+        assert!(preview.contains("omitted"));
+    }
+
+    #[test]
+    fn clip_head_passes_short_strings_through() {
+        assert_eq!(clip_head("hi".into()), "hi");
+    }
+
+    #[test]
     fn simple_glob_matches_star_and_doublestar() {
         assert!(simple_glob_match("*.rs", "main.rs"));
         assert!(!simple_glob_match("*.rs", "main.rs.bak"));
@@ -1066,7 +1275,9 @@ mod tests {
             .output
             .unwrap();
         assert_eq!(out["replaced"], 1);
-        assert_eq!(out["repair"], "json_escape_unwrapped");
+        // Repair is silent: the success output must NOT surface a `repair`
+        // field to the model (MiMoCode "success silent" policy).
+        assert!(out.get("repair").is_none(), "repair leaked into output: {out}");
         let after = rt
             .invoke(ToolInvocation {
                 id: "tc_read".into(),

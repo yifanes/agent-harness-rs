@@ -170,17 +170,14 @@ impl<E: SandboxExecutor + Clone> SandboxToolRuntime<E> {
     /// sandbox and return a preview with the path, or return unchanged if
     /// content is within the output budget.
     async fn bound_output(&self, content: String, id: &str, suffix: &str) -> String {
-        if content.len() <= crate::tools::MAX_OUTPUT_BYTES {
-            return content;
-        }
         let path = format!("/tmp/harness_out_{id}_{suffix}.txt");
-        let _ = self.executor.write_file(&path, &content).await;
-        let preview: String = content.chars().take(crate::tools::MAX_OUTPUT_BYTES / 2).collect();
-        format!(
-            "{preview}\n\n[{} bytes total, truncated. \
-             Full output saved to {path} — use the read tool to fetch more.]",
-            content.len()
-        )
+        match crate::tools::bounded_preview(&content, &path) {
+            None => content,
+            Some(preview) => {
+                let _ = self.executor.write_file(&path, &content).await;
+                preview
+            }
+        }
     }
 
     async fn sandbox_bash(&self, inv: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError> {
@@ -425,9 +422,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 fn truncate(s: String) -> String {
-    if s.len() <= crate::tools::MAX_OUTPUT_BYTES { return s; }
-    let kept: String = s.chars().take(crate::tools::MAX_OUTPUT_BYTES).collect();
-    format!("{kept}\n\n[content truncated: use offset/limit to read more]")
+    crate::tools::clip_head(s)
 }
 
 fn req_str<'a>(inv: &'a ToolInvocation, key: &str) -> Result<&'a str, ToolRuntimeError> {

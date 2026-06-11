@@ -13,7 +13,8 @@ use crate::model::{
 };
 use crate::runner::NativeHarness;
 use crate::tools::{
-    ToolFailure, ToolFailureKind, ToolInvocation, ToolOutcome, ToolRuntime, ToolRuntimeError,
+    bounded::BoundedToolRuntime, ToolFailure, ToolFailureKind, ToolInvocation, ToolOutcome,
+    ToolRuntime, ToolRuntimeError,
 };
 
 /// Optional compaction wiring: strategy + the model client used to run
@@ -49,7 +50,10 @@ const DEFAULT_STREAM_MAX_ATTEMPTS: u32 = 6;
 #[derive(Clone)]
 pub struct AgentLoopHarness<M, R> {
     model: M,
-    tools: R,
+    /// Every runtime is wrapped so repair + validation + tracing + the
+    /// safety-net output cap apply uniformly, regardless of which concrete
+    /// runtime the caller passed to [`AgentLoopHarness::new`].
+    tools: BoundedToolRuntime<R>,
     max_steps: usize,
     compaction: Option<CompactionPolicy>,
     tool_choice: crate::model::ToolChoice,
@@ -58,11 +62,11 @@ pub struct AgentLoopHarness<M, R> {
     stream_max_attempts: u32,
 }
 
-impl<M, R> AgentLoopHarness<M, R> {
+impl<M, R: ToolRuntime> AgentLoopHarness<M, R> {
     pub fn new(model: M, tools: R) -> Self {
         Self {
             model,
-            tools,
+            tools: BoundedToolRuntime::new(tools),
             max_steps: 8,
             compaction: None,
             tool_choice: crate::model::ToolChoice::Auto,
@@ -515,13 +519,11 @@ async fn run_loop<M, R>(
                 // No matching spec (e.g. model hallucinated a tool name) →
                 // leave the input alone; dispatch will fail it as unknown.
                 for inv in &mut invocations {
-                    let Some(spec) = tools_snapshot.iter().find(|s| s.name == inv.name) else {
-                        continue;
-                    };
-                    if let Some((fixed, repairs)) = crate::tool_repair::repair_tool_input_for_spec(
-                        &spec.input_schema,
-                        &inv.input,
-                    ) {
+                    // Repair lives in the runtime wrapper (single source of
+                    // truth). Running it here — before the history push and
+                    // ToolCall events below — keeps history, wire, and the
+                    // wrapper's (idempotent) dispatch-time repair in agreement.
+                    if let Some(repairs) = tools.repair_invocation(inv) {
                         tracing::warn!(
                             target: "harness::tool_repair",
                             tool = %inv.name,
@@ -529,7 +531,6 @@ async fn run_loop<M, R>(
                             repairs = ?repairs,
                             "schema-guided tool input repair applied"
                         );
-                        inv.input = fixed;
                     }
                 }
                 let preface_text = preface.filter(|s| !s.is_empty());
@@ -631,7 +632,15 @@ async fn run_loop<M, R>(
                             attachments: vec![],
                         },
                         Err(ToolRuntimeError::InvalidInput { tool, message }) => ToolOutcome {
-                            output: Err(crate::tools::invalid_input_failure(&tool, message, &inv.input)),
+                            output: Err(crate::tools::invalid_input_failure(
+                                &tool,
+                                message,
+                                &inv.input,
+                                tools_snapshot
+                                    .iter()
+                                    .find(|s| s.name == tool)
+                                    .map(|s| &s.input_schema),
+                            )),
                             attachments: vec![],
                         },
                         Err(e) => {
@@ -1738,10 +1747,13 @@ mod tests {
         match rx.recv().await.unwrap().unwrap() {
             HarnessInternalEvent::ToolResult { output, .. } => {
                 let err = output.unwrap_err();
+                // Now caught by the wrapper's schema validation BEFORE the
+                // inner runtime, with a teaching example appended.
                 assert!(err.contains("The write tool was called with invalid arguments"));
-                assert!(err.contains("missing string field path"));
+                assert!(err.contains("missing required field `path`"), "{err}");
                 assert!(err.contains("Received fields: content"));
                 assert!(err.contains("string(20000 chars"));
+                assert!(err.contains("Expected shape"), "teaching example missing: {err}");
                 assert!(!err.contains(&"x".repeat(2000)), "error should not echo full content");
             }
             other => panic!("expected invalid-input ToolResult, got {other:?}"),
