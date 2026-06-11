@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod model;
 pub mod runner;
 pub mod shell_risk;
+pub mod skills;
 pub mod tool_repair;
 pub mod tools;
 
@@ -30,6 +31,10 @@ pub use model::{
 };
 pub use runner::{FakeNativeHarness, NativeHarness, ToolCapableFakeHarness};
 pub use shell_risk::{classify_shell_command, ShellRiskDecision, ShellRiskLevel};
+pub use skills::{
+    parse_skill_frontmatter, LocalSkillSource, SkillError, SkillLoader, SkillMetadata,
+    SkillPromptRenderer, SkillSource, SkillsManager,
+};
 pub use tools::{
     builtin_tool_specs, fs_glob, fs_glob_bounded, resolve_edit_search, simple_glob_match,
     EditSearchError, MockToolRuntime, ResolvedEditSearch, ToolFailure, ToolFailureKind,
