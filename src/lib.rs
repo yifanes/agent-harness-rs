@@ -13,8 +13,10 @@ pub mod tools;
 
 pub use agent_loop::{AgentLoopHarness, CompactionPolicy};
 pub use compaction::{
-    estimate_messages_tokens, resolve_context_window_tokens, CompactionContext, CompactionError,
-    CompactionStrategy, SummarizeCompactionStrategy,
+    estimate_messages_tokens, prune_tool_outputs, resolve_context_window_tokens,
+    CompactionContext, CompactionError, CompactionOutcome, CompactionStrategy,
+    SummarizeCompactionStrategy, PRUNE_MIN_CONTENT_TOKENS, PRUNE_MINIMUM_TOKENS,
+    PRUNE_PROTECT_TURNS, PRUNED_CONTENT_STUB,
 };
 pub use context::jsonl::{append_context, load_context, rewrite_context};
 pub use event::{HarnessInternalEvent, HarnessUsage, NativeHarnessError, NativeTurnInput};

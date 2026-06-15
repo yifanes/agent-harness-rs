@@ -38,6 +38,23 @@ use crate::tools::ToolSpec;
 /// the model's reply, matching Codex's default threshold.
 pub const DEFAULT_TRIGGER_FRACTION: f64 = 0.90;
 
+/// Number of recent user-turn boundaries whose tool outputs are protected
+/// from the prune pass.  The last `PRUNE_PROTECT_TURNS` complete turns are
+/// left untouched so the model retains full detail for the current task.
+pub const PRUNE_PROTECT_TURNS: usize = 2;
+
+/// Minimum net tokens that the prune pass must free before its mutations
+/// are committed.  Below this floor the overhead is not worth the churn.
+pub const PRUNE_MINIMUM_TOKENS: u64 = 2_000;
+
+/// Per-output floor: tool results shorter than this are never pruned even
+/// when they fall outside the protected window.
+pub const PRUNE_MIN_CONTENT_TOKENS: u64 = 100;
+
+/// Replacement text written into pruned tool outputs.
+pub const PRUNED_CONTENT_STUB: &str =
+    "[pruned — output removed to free context; re-run the tool if needed]";
+
 /// Minimum number of messages the history must contain before compaction
 /// is allowed to run. Below this floor the history is too short to benefit
 /// from compaction and the call is a no-op.
@@ -298,6 +315,37 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
             });
         }
 
+        // ── Phase 1: Prune old tool outputs (free tokens without a model call)
+        //
+        // Walk old turns and replace large tool outputs with a short stub.
+        // If pruning alone brings the history back under the trigger threshold
+        // we skip the expensive summarise round-trip entirely.
+        let threshold =
+            ((ctx.context_window_tokens as f64) * self.trigger_fraction).round() as u64;
+        let (messages, freed_tokens) = prune_tool_outputs(messages, PRUNE_PROTECT_TURNS);
+        if freed_tokens > 0 {
+            tracing::debug!(
+                target: "harness::compaction",
+                freed_tokens,
+                "prune pass freed tokens"
+            );
+            let tokens_after_prune = estimate_messages_tokens(&messages);
+            if tokens_after_prune <= threshold {
+                tracing::info!(
+                    target: "harness::compaction",
+                    freed_tokens,
+                    tokens_after_prune,
+                    "prune sufficient — summarise skipped"
+                );
+                return Ok(CompactionOutcome {
+                    messages,
+                    usage: None,
+                });
+            }
+        }
+
+        // ── Phase 2: Summarise (model round-trip)
+        //
         // Build the summarize request. Same system + same tools as the
         // main agent would use, then append one User message asking
         // for the summary. We DON'T set tools: vec![] — keeping them
@@ -450,6 +498,74 @@ fn truncate_to_token_budget(s: &str, budget: u64) -> String {
         end = byte_pos + c.len_utf8();
     }
     s[..end].to_string()
+}
+
+/// Lightweight prune pass: replace large old tool outputs with
+/// [`PRUNED_CONTENT_STUB`] to free tokens before (or instead of) a full
+/// summarise round-trip.
+///
+/// Algorithm:
+///   1. Walk the message list backwards.
+///   2. Skip tool outputs inside the most recent `protect_turns` user turns.
+///   3. Stop at any prior `<conversation-summary>` boundary — everything
+///      before it was already compacted.
+///   4. Accumulate gross freed tokens for each `ChatMessage::Tool` whose
+///      content exceeds [`PRUNE_MIN_CONTENT_TOKENS`].
+///   5. If net freed tokens ≥ [`PRUNE_MINIMUM_TOKENS`], apply the mutations
+///      and return the updated list; otherwise return the original unchanged.
+///
+/// Returns `(messages, net_tokens_freed)`.  `net_tokens_freed == 0` means
+/// the list was not modified (either nothing qualified or the saving was
+/// below the minimum).
+pub fn prune_tool_outputs(
+    messages: Vec<ChatMessage>,
+    protect_turns: usize,
+) -> (Vec<ChatMessage>, u64) {
+    let stub_tokens = estimate_tokens(PRUNED_CONTENT_STUB);
+    let mut user_turns_seen: usize = 0;
+    // Collect (index, gross_tokens) for candidates.
+    let mut candidates: Vec<(usize, u64)> = Vec::new();
+    let mut gross_freed: u64 = 0;
+
+    for (i, msg) in messages.iter().enumerate().rev() {
+        match msg {
+            ChatMessage::User { content, .. } => {
+                if is_summary_message(content) {
+                    // Prior compaction boundary — stop here.
+                    break;
+                }
+                user_turns_seen += 1;
+            }
+            ChatMessage::Tool { content, .. } => {
+                // Protected window: skip recent turns.
+                if user_turns_seen < protect_turns {
+                    continue;
+                }
+                let tokens = estimate_tokens(content);
+                if tokens >= PRUNE_MIN_CONTENT_TOKENS {
+                    candidates.push((i, tokens));
+                    gross_freed += tokens;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Net gain after we write the stub back in.
+    let replacements = candidates.len() as u64;
+    let net_freed = gross_freed.saturating_sub(stub_tokens * replacements);
+
+    if net_freed < PRUNE_MINIMUM_TOKENS {
+        return (messages, 0);
+    }
+
+    let mut out = messages;
+    for (i, _) in &candidates {
+        if let ChatMessage::Tool { content, .. } = &mut out[*i] {
+            *content = PRUNED_CONTENT_STUB.to_string();
+        }
+    }
+    (out, net_freed)
 }
 
 #[cfg(test)]
@@ -700,5 +816,145 @@ mod tests {
         // Same messages back — no compaction happened, no model call.
         assert_eq!(outcome.messages, messages);
         assert!(outcome.usage.is_none());
+    }
+
+    // ── prune_tool_outputs tests ─────────────────────────────────────────────
+
+    fn big_tool(id: &str) -> ChatMessage {
+        // ~2 100 tokens — above PRUNE_MIN_CONTENT_TOKENS (100) and,
+        // when a single instance is pruneable, above PRUNE_MINIMUM_TOKENS (2 000)
+        // net of the stub replacement (~18 tokens).
+        tool_msg(id, &"x".repeat(8_400))
+    }
+
+    fn small_tool(id: &str) -> ChatMessage {
+        // 10 tokens — below the per-output floor, must NOT be pruned
+        tool_msg(id, &"x".repeat(40))
+    }
+
+    #[test]
+    fn prune_replaces_old_large_tool_outputs() {
+        // History: 3 user turns, each followed by a big tool result.
+        // protect_turns=2 → last 2 turns are safe; turn 0 (oldest) is pruneable.
+        let messages = vec![
+            user("turn 0"),
+            big_tool("t0"),
+            user("turn 1"),
+            big_tool("t1"),
+            user("turn 2"),
+            big_tool("t2"),
+        ];
+        let (pruned, freed) = prune_tool_outputs(messages, 2);
+        // Only t0 should be pruned (oldest, outside the 2-turn window).
+        assert!(freed > 0, "expected tokens to be freed");
+        assert_eq!(pruned[1], tool_msg("t0", PRUNED_CONTENT_STUB));
+        // t1 and t2 are inside protected window — untouched.
+        assert_ne!(pruned[3], tool_msg("t1", PRUNED_CONTENT_STUB));
+        assert_ne!(pruned[5], tool_msg("t2", PRUNED_CONTENT_STUB));
+    }
+
+    #[test]
+    fn prune_does_not_touch_small_tool_outputs() {
+        let messages = vec![
+            user("turn 0"),
+            small_tool("t0"),
+            user("turn 1"),
+            big_tool("t1"),
+            user("turn 2"),
+            big_tool("t2"),
+        ];
+        let (pruned, _freed) = prune_tool_outputs(messages.clone(), 2);
+        // t0 is old but small — must stay intact.
+        assert_eq!(pruned[1], messages[1]);
+    }
+
+    #[test]
+    fn prune_no_op_when_savings_below_minimum() {
+        // Only one small old tool output — net freed < PRUNE_MINIMUM_TOKENS.
+        let messages = vec![
+            user("turn 0"),
+            small_tool("t0"),
+            user("turn 1"),
+            big_tool("t1"),
+            user("turn 2"),
+        ];
+        // small_tool is below PRUNE_MIN_CONTENT_TOKENS → nothing qualifies.
+        let (out, freed) = prune_tool_outputs(messages.clone(), 2);
+        assert_eq!(freed, 0);
+        assert_eq!(out, messages);
+    }
+
+    #[test]
+    fn prune_stops_at_summary_boundary() {
+        // Layout (chronological):
+        //   turn 0 / t_before  ← before the summary; must NOT be pruned
+        //   <summary>          ← compaction boundary; reverse walk stops here
+        //   turn 1 / t1        ← after summary but inside protected window
+        //   turn 2 / t2        ← after summary but inside protected window
+        //
+        // Without the summary, t_before (oldest, outside protect window)
+        // WOULD be pruned.  With it, the reverse walk hits the summary and
+        // breaks before reaching t_before, so freed == 0.
+        let messages = vec![
+            user("turn 0"),
+            big_tool("t_before"),
+            user("<conversation-summary>\nprevious context\n</conversation-summary>"),
+            user("turn 1"),
+            big_tool("t1"),
+            user("turn 2"),
+            big_tool("t2"),
+        ];
+        let (out, freed) = prune_tool_outputs(messages.clone(), 2);
+        assert_eq!(freed, 0, "summary boundary must block pruning of earlier content");
+        assert_eq!(out, messages);
+    }
+
+    #[tokio::test]
+    async fn compact_skips_summarise_when_prune_sufficient() {
+        // A strategy that would summarise if called — we verify it is NOT
+        // called when prune brings tokens below the threshold.
+        struct PanicSummaryClient;
+        #[async_trait::async_trait]
+        impl ModelClient for PanicSummaryClient {
+            async fn stream(
+                &self,
+                _: ModelTurnInput,
+            ) -> Result<BoxStream<'static, Result<ModelChunk, ModelClientError>>, ModelClientError>
+            {
+                panic!("summarise should not be called when prune is sufficient");
+            }
+        }
+
+        // Build a history that is over the threshold purely because of one
+        // big tool output in the oldest turn.  After pruning it the total
+        // drops below the threshold.
+        let big_content = "y".repeat(200_000); // ~50k tokens
+        let messages = vec![
+            user("turn 0"),
+            tool_msg("t0", &big_content),
+            user("turn 1"),
+            assistant_text("ok"),
+            user("turn 2"),
+            assistant_text("done"),
+        ];
+        let ctx = CompactionContext {
+            system_prompt: None,
+            model_client: Arc::new(PanicSummaryClient),
+            context_window_tokens: 60_000,
+            tools: vec![],
+        };
+        let strat = SummarizeCompactionStrategy {
+            trigger_fraction: 0.9,
+            tail_min_messages: 2,
+            ..Default::default()
+        };
+        let outcome = strat.compact(messages, &ctx).await.unwrap();
+        // Prune replaced the big output — usage is None (no model call).
+        assert!(outcome.usage.is_none());
+        // The stub is present at index 1.
+        assert_eq!(
+            outcome.messages[1],
+            tool_msg("t0", PRUNED_CONTENT_STUB)
+        );
     }
 }
