@@ -478,7 +478,7 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
     };
 
     let mut cmd = Command::new("grep");
-    cmd.arg("-rn");
+    cmd.args(["-rn", "-E"]);
     if ci { cmd.arg("-i"); }
     cmd.args([
         "--exclude-dir=node_modules",
