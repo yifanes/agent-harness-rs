@@ -14,15 +14,16 @@ Agent loop harness for building LLM-powered coding agents. Provides a complete r
 - **E2b integration** — `E2bToolRuntime` via Connect Protocol to envd (`feature = "e2b"`)
 - **Context persistence** — JSONL-based context store with incremental append and compaction rewrite
 - **MCP support** — HTTP and stdio MCP server integration via `CompositeToolRuntime`
+- **Model limits catalog** — async `models.dev` fetch with disk cache, backoff retry, and offline fallback for context-window / output-token resolution
 
 ## Quick start
 
 ```toml
 [dependencies]
-agent-harness-rs = "0.1"
+agent-harness-rs = "0.2"
 
 # For e2b sandbox support:
-agent-harness-rs = { version = "0.1", features = ["e2b"] }
+agent-harness-rs = { version = "0.2", features = ["e2b"] }
 ```
 
 ```rust
@@ -78,6 +79,46 @@ let tools = E2bToolRuntime::connect(E2bConfig::new(
 
 let harness = AgentLoopHarness::new(model, tools);
 ```
+
+## Model limits catalog
+
+Context-window and output-token limits are resolved per model from
+[`models.dev`](https://models.dev) (the public model registry opencode
+also uses), with a best-effort strategy that never blocks the agent loop:
+
+1. **In-memory table** populated by a fire-and-forget background fetch.
+   On the first `resolve_limits()` call a fetch is spawned; while it is
+   in flight (typically during early LLM warm-up) callers get the
+   fallback value, and pick up the real value on the next turn.
+2. **Disk cache** at `<cache_dir>/agent-harness-rs/models.json` (5 min
+   TTL, atomic tempfile + `rename` write) so a network blip mid-session
+   still serves real values.
+3. **Offline fallback table** — the legacy hand-encoded claude/gpt/
+   o-series/minimax/deepseek mappings, so behavior never regresses.
+4. **Conservative default** `{ context: 128_000, output: 8_192 }`.
+
+The fetch retries 3× with exponential backoff (+ jitter) and a 10 s
+per-request timeout; on final failure it logs and falls back silently.
+
+```rust
+use harness::{resolve_limits, prefetch_model_limits};
+
+// Optional: warm the cache before the first turn. Safe to skip — the
+// first resolve_limits() triggers it lazily.
+prefetch_model_limits();
+
+// Fast, non-async, never blocks.
+let limits = resolve_limits("claude-opus-4-7");
+// limits.context  — used for compaction thresholds
+// limits.output   — model's per-completion output cap
+```
+
+Configuration via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_HARNESS_MODELS_URL` | `https://models.dev/api.json` | Override the registry endpoint |
+| `AGENT_HARNESS_CACHE_PATH` | `<cache_dir>/agent-harness-rs/models.json` | Relocate the disk cache |
 
 ## Approval modes
 

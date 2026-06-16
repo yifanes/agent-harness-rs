@@ -1,6 +1,6 @@
 [package]
 name = "agent-harness-rs"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 authors = ["yifanes"]
 license = "MIT"
@@ -24,6 +24,7 @@ tokio              = { version = "1", features = ["full"] }
 tokio-stream       = "0.1"
 tokio-util         = { version = "0.7", features = ["rt"] }
 reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+dirs               = "5"
 futures            = "0.3"
 eventsource-stream = "0.2"
 tracing            = "0.1"

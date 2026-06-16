@@ -1,6 +1,7 @@
 pub mod agent_loop;
 pub mod compaction;
 pub mod context;
+pub mod model_limits;
 pub mod event;
 pub mod history_sanitize;
 pub mod mcp;
@@ -17,6 +18,10 @@ pub use compaction::{
     CompactionContext, CompactionError, CompactionOutcome, CompactionStrategy,
     SummarizeCompactionStrategy, PRUNE_MIN_CONTENT_TOKENS, PRUNE_MINIMUM_TOKENS,
     PRUNE_PROTECT_TURNS, PRUNED_CONTENT_STUB,
+};
+pub use model_limits::{
+    prefetch as prefetch_model_limits, resolve_limits, ModelLimits,
+    DEFAULT_CONTEXT_TOKENS, DEFAULT_OUTPUT_TOKENS,
 };
 pub use context::jsonl::{append_context, load_context, rewrite_context};
 pub use event::{HarnessInternalEvent, HarnessUsage, NativeHarnessError, NativeTurnInput};

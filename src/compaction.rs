@@ -132,38 +132,16 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(estimate_chat_message_tokens).sum()
 }
 
-/// Per-model context window in tokens. Anthropic / OpenAI don't expose
-/// this through their wire APIs, so we keep a hand-encoded table and
-/// fall back to a conservative 128 000 (the smallest current "modern"
-/// model window — GPT-4o / Claude Haiku 3.5).
+/// Per-model context window in tokens. Delegates to
+/// [`crate::model_limits::resolve_limits`] — see that module for the
+/// full resolution chain (models.dev fetch + disk cache + fallback
+/// table + conservative default).
 ///
-/// Adding a new model: extend the table. Unknown model strings fall to
-/// the default and a warning would be appropriate — but compaction is
-/// best-effort so we just default rather than refuse to run.
+/// Kept as a thin shim for backwards compatibility; new code should
+/// call [`crate::model_limits::resolve_limits`] to also get the model's
+/// output-token cap.
 pub fn resolve_context_window_tokens(model: &str) -> u64 {
-    let m = model.to_ascii_lowercase();
-    // Claude 4.6 / 4.7 1M context window (Sonnet / Opus extended).
-    if m.contains("opus-4-7") || m.contains("opus-4-6") || m.contains("sonnet-4-6") {
-        return 1_000_000;
-    }
-    // Anthropic Claude 3.x / 4.x: 200K
-    if m.contains("claude") {
-        return 200_000;
-    }
-    // OpenAI GPT-4 family: 128K
-    if m.contains("gpt-4") || m.contains("gpt-4o") || m.contains("gpt-4.1") {
-        return 128_000;
-    }
-    // OpenAI o1 / o3 reasoning: 200K
-    if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
-        return 200_000;
-    }
-    // MiniMax / DeepSeek / Groq commonly advertise 1M.
-    if m.contains("minimax") || m.contains("deepseek") {
-        return 1_000_000;
-    }
-    // Conservative default.
-    128_000
+    crate::model_limits::resolve_context_window_tokens(model)
 }
 
 /// Context passed to `compact()`. Owns the model client + tools the
