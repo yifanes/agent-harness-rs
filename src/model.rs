@@ -163,6 +163,10 @@ pub struct ModelTurnInput {
     /// so adding / removing a tool changes one place. Empty Vec ⇒ no tools
     /// advertised (final-answer-only mode).
     pub tools: Vec<ToolSpec>,
+    /// Provider-executed tools. These are not dispatched through
+    /// `ToolRuntime`; the model provider runs them server-side and streams
+    /// the final answer back through normal text deltas.
+    pub hosted_tools: Vec<HostedTool>,
     /// How the model should pick (or skip) tools. Defaults to `Auto`.
     /// Set via `AgentLoopHarness::with_tool_choice` from
     /// `bootstrap.driver.native_model.tool_choice`.
@@ -172,6 +176,15 @@ pub struct ModelTurnInput {
     /// default (true for OpenAI). Anthropic is always implicitly
     /// multi-tool-capable so this field is OpenAI-only.
     pub parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HostedTool {
+    WebSearch {
+        /// Anthropic server-tool safety cap. `None` leaves the provider
+        /// default in place.
+        max_uses: Option<u32>,
+    },
 }
 
 /// How the model should route tool selection for the current turn.
@@ -747,6 +760,13 @@ impl ModelClient for OpenAiCompatibleModelClient {
         &self,
         input: ModelTurnInput,
     ) -> Result<BoxStream<'static, Result<ModelChunk, ModelClientError>>, ModelClientError> {
+        if !input.hosted_tools.is_empty() {
+            return Err(ModelClientError::Other(
+                "hosted tools are not supported by OpenAiCompatibleModelClient; \
+                 OpenAI web_search requires a Responses API client"
+                    .into(),
+            ));
+        }
         // Bolt-on streaming flags. `stream_options.include_usage` is a
         // recent OpenAI addition that makes the final SSE event carry the
         // usage block; without it streaming responses drop usage entirely.
@@ -1269,11 +1289,13 @@ impl AnthropicModelClient {
         let tools = if matches!(input.tool_choice, ToolChoice::None) {
             Vec::new()
         } else {
-            input
+            let mut tools = input
                 .tools
                 .iter()
                 .map(tool_spec_to_anthropic_tool)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            tools.extend(input.hosted_tools.iter().map(hosted_tool_to_anthropic_tool));
+            tools
         };
         let system_field = anthropic_system_field(input.system_prompt.as_deref());
 
@@ -1566,6 +1588,21 @@ fn tool_spec_to_anthropic_tool(spec: &ToolSpec) -> Value {
     })
 }
 
+fn hosted_tool_to_anthropic_tool(tool: &HostedTool) -> Value {
+    match tool {
+        HostedTool::WebSearch { max_uses } => {
+            let mut value = json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+            });
+            if let Some(max_uses) = max_uses {
+                value["max_uses"] = json!(max_uses);
+            }
+            value
+        }
+    }
+}
+
 struct AnthropicCached {
     system: Option<Value>,
     tools: Vec<Value>,
@@ -1677,6 +1714,7 @@ enum AnthropicBlock {
     Text,
     Thinking { thinking_id: String },
     ToolUse { id: String },
+    Ignored,
 }
 
 impl AnthropicStreamState {
@@ -1749,11 +1787,14 @@ impl AnthropicStreamState {
                         }
                         self.blocks.insert(index, AnthropicBlock::ToolUse { id });
                     }
+                    Some("server_tool_use") | Some("web_search_tool_result") => {
+                        self.blocks.insert(index, AnthropicBlock::Ignored);
+                    }
                     _ => {
                         // Unknown block type — record as Text so we
                         // don't panic on later deltas; ignoring them
                         // is the safer forward-compat path.
-                        self.blocks.insert(index, AnthropicBlock::Text);
+                        self.blocks.insert(index, AnthropicBlock::Ignored);
                     }
                 }
             }
@@ -1955,6 +1996,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         }
@@ -2031,6 +2073,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         };
@@ -2063,6 +2106,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Required,
             parallel_tool_calls: Some(false),
         });
@@ -2087,6 +2131,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Tool("bash".into()),
             parallel_tool_calls: None,
         });
@@ -2114,11 +2159,42 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::None,
             parallel_tool_calls: None,
         });
         assert!(body.get("tools").is_none(), "tools should be dropped");
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_rejects_hosted_web_search() {
+        let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
+            base_url: "https://example.test".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-test".into(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        });
+        let err = match client
+            .stream(ModelTurnInput {
+                system_prompt: None,
+                messages: vec![ChatMessage::User {
+                    content: "search".into(),
+                    attachments: vec![],
+                }],
+                tools: vec![],
+                hosted_tools: vec![HostedTool::WebSearch { max_uses: None }],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: None,
+            })
+            .await
+        {
+            Ok(_) => panic!("expected hosted tool rejection"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Responses API"));
     }
 
     #[test]
@@ -2157,6 +2233,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         };
@@ -2776,6 +2853,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         });
@@ -2796,6 +2874,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Required,
             parallel_tool_calls: Some(true),
         });
@@ -2803,6 +2882,29 @@ mod tests {
         // OpenAI-only knob must NOT leak into Anthropic body even when
         // caller set it (harness passes it uniformly to both providers).
         assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn anthropic_client_projects_hosted_web_search_tool() {
+        let client = anthropic_client_for_tool_choice_tests();
+        let body = client.request_body(&ModelTurnInput {
+            system_prompt: None,
+            messages: vec![ChatMessage::User {
+                content: "research current AI market".into(),
+                attachments: vec![],
+            }],
+            tools: vec![bash_spec()],
+            hosted_tools: vec![HostedTool::WebSearch { max_uses: Some(3) }],
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: None,
+        });
+        let tools = body["tools"].as_array().unwrap();
+        let web = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("web_search"))
+            .unwrap();
+        assert_eq!(web["type"], "web_search_20250305");
+        assert_eq!(web["max_uses"], 3);
     }
 
     #[test]
@@ -2815,6 +2917,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Tool("bash".into()),
             parallel_tool_calls: None,
         });
@@ -2835,6 +2938,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::None,
             parallel_tool_calls: None,
         });
@@ -3176,6 +3280,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         });
@@ -3226,6 +3331,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            hosted_tools: vec![],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         };

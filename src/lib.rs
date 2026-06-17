@@ -32,7 +32,7 @@ pub use mcp::{
 };
 pub use model::{
     collect_model_response, AnthropicConfig, AnthropicModelClient, AssistantThinking, ChatMessage,
-    ImageData, ImageSource, ModelChunk, ModelClient, ModelClientError, ModelResponse,
+    HostedTool, ImageData, ImageSource, ModelChunk, ModelClient, ModelClientError, ModelResponse,
     ModelTurnInput, OpenAiCompatibleConfig, OpenAiCompatibleModelClient, ScriptedModelClient,
     ToolChoice, UserAttachment,
 };

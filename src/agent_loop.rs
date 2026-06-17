@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::compaction::{estimate_messages_tokens, CompactionContext, CompactionStrategy};
 use crate::event::{HarnessInternalEvent, HarnessUsage, NativeHarnessError, NativeTurnInput};
 use crate::model::{
-    AssistantThinking, ChatMessage, ModelChunk, ModelClient, ModelClientError, ModelTurnInput,
+    AssistantThinking, ChatMessage, HostedTool, ModelChunk, ModelClient, ModelClientError,
+    ModelTurnInput,
 };
 use crate::runner::NativeHarness;
 use crate::tools::{
@@ -57,6 +58,7 @@ pub struct AgentLoopHarness<M, R> {
     max_steps: usize,
     compaction: Option<CompactionPolicy>,
     tool_choice: crate::model::ToolChoice,
+    hosted_tools: Vec<HostedTool>,
     parallel_tool_calls: Option<bool>,
     stream_idle_timeout: Duration,
     stream_max_attempts: u32,
@@ -70,6 +72,7 @@ impl<M, R: ToolRuntime> AgentLoopHarness<M, R> {
             max_steps: 8,
             compaction: None,
             tool_choice: crate::model::ToolChoice::Auto,
+            hosted_tools: vec![],
             parallel_tool_calls: None,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_max_attempts: DEFAULT_STREAM_MAX_ATTEMPTS,
@@ -99,6 +102,21 @@ impl<M, R: ToolRuntime> AgentLoopHarness<M, R> {
     /// Defaults to `Auto`. See `ToolChoice` for variants.
     pub fn with_tool_choice(mut self, choice: crate::model::ToolChoice) -> Self {
         self.tool_choice = choice;
+        self
+    }
+
+    /// Enable provider-executed hosted tools, such as Anthropic native
+    /// web_search. These tools are not part of `ToolRuntime` and are never
+    /// executed by the harness itself.
+    pub fn with_hosted_tools(mut self, tools: Vec<HostedTool>) -> Self {
+        self.hosted_tools = tools;
+        self
+    }
+
+    /// Convenience helper for provider-native web search.
+    pub fn with_web_search(mut self) -> Self {
+        self.hosted_tools
+            .push(HostedTool::WebSearch { max_uses: None });
         self
     }
 
@@ -140,6 +158,7 @@ where
         let max_steps = self.max_steps;
         let compaction = self.compaction.clone();
         let tool_choice = self.tool_choice.clone();
+        let hosted_tools = self.hosted_tools.clone();
         let parallel_tool_calls = self.parallel_tool_calls;
         let stream_idle_timeout = self.stream_idle_timeout;
         let stream_max_attempts = self.stream_max_attempts;
@@ -152,6 +171,7 @@ where
                     max_steps,
                     compaction,
                     tool_choice,
+                    hosted_tools,
                     parallel_tool_calls,
                     stream_idle_timeout,
                     stream_max_attempts,
@@ -171,10 +191,15 @@ fn cancel_fired(token: Option<&CancellationToken>) -> bool {
     token.is_some_and(|t| t.is_cancelled())
 }
 
+fn is_silent_stop(text: &str, stop_reason: &str) -> bool {
+    text.trim().is_empty() && matches!(stop_reason, "end_turn" | "max_tokens")
+}
+
 struct RunLoopConfig {
     max_steps: usize,
     compaction: Option<CompactionPolicy>,
     tool_choice: crate::model::ToolChoice,
+    hosted_tools: Vec<HostedTool>,
     parallel_tool_calls: Option<bool>,
     stream_idle_timeout: Duration,
     stream_max_attempts: u32,
@@ -346,6 +371,7 @@ async fn run_loop<M, R>(
             system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             tools: tools_snapshot.clone(),
+            hosted_tools: config.hosted_tools.clone(),
             tool_choice: config.tool_choice.clone(),
             parallel_tool_calls: config.parallel_tool_calls,
         };
@@ -484,7 +510,16 @@ async fn run_loop<M, R>(
 
         match outcome.next {
             StepNext::Message { text, stop_reason } => {
-                let assistant_text = (!text.is_empty()).then_some(text);
+                if is_silent_stop(&text, &stop_reason) {
+                    let _ = tx
+                        .send(Err(NativeHarnessError::ModelOther(format!(
+                            "silent_stop: model returned stop_reason={stop_reason} \
+                             with empty text and no tool calls"
+                        ))))
+                        .await;
+                    return;
+                }
+                let assistant_text = (!text.trim().is_empty()).then_some(text);
                 messages.push(ChatMessage::Assistant {
                     text: assistant_text,
                     tool_calls: vec![],
@@ -837,6 +872,7 @@ async fn consume_step_stream(
     let emit_msg_id = format!("msg_native_{step}");
     let emit_thinking_id = format!("thinking_native_{step}");
     let mut text_buf = String::new();
+    let mut text_stream_started = false;
     let mut thinking_buf = String::new();
     let mut thinking_signature: Option<String> = None;
     let mut saw_thinking = false;
@@ -893,6 +929,16 @@ async fn consume_step_stream(
                     continue;
                 }
                 text_buf.push_str(&delta);
+                let mut flush_delta = delta;
+                if !text_stream_started {
+                    if text_buf.trim().is_empty() {
+                        continue;
+                    }
+                    text_stream_started = true;
+                    // First visible chunk: flush any leading whitespace we
+                    // held back while deciding whether the step is silent.
+                    flush_delta = text_buf.clone();
+                }
                 // A non-empty text delta is model output the user is about to
                 // see — past this point a stall is no longer safe to retry.
                 had_progress = true;
@@ -902,7 +948,7 @@ async fn consume_step_stream(
                 if tx
                     .send(Ok(HarnessInternalEvent::AssistantTextChunk {
                         msg_id: emit_msg_id.clone(),
-                        delta,
+                        delta: flush_delta,
                     }))
                     .await
                     .is_err()
@@ -1224,6 +1270,64 @@ mod tests {
         assert_eq!(u.input_tokens, 30);
         assert_eq!(u.output_tokens, 20);
         assert_eq!(u.cache_read_input_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_errors_on_silent_stop() {
+        let model = QueueModelClient::new(vec![ModelResponse::Message {
+            text: "   \n".into(),
+            stop_reason: "end_turn".into(),
+            usage: None,
+        }]);
+        let harness = AgentLoopHarness::new(model, MockToolRuntime::new());
+        let mut rx = harness
+            .run_turn(NativeTurnInput {
+                prompt_text: "say something".into(),
+                system_prompt: None,
+                attachments: vec![],
+                cancel_token: None,
+                prior_messages: vec![],
+                context_path: None,
+            })
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            Err(NativeHarnessError::ModelOther(msg)) => {
+                assert!(msg.contains("silent_stop"));
+                assert!(msg.contains("stop_reason=end_turn"));
+            }
+            other => panic!("expected silent_stop model error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_errors_on_empty_max_tokens_stop() {
+        let model = QueueModelClient::new(vec![ModelResponse::Message {
+            text: "".into(),
+            stop_reason: "max_tokens".into(),
+            usage: None,
+        }]);
+        let harness = AgentLoopHarness::new(model, MockToolRuntime::new());
+        let mut rx = harness
+            .run_turn(NativeTurnInput {
+                prompt_text: "think".into(),
+                system_prompt: None,
+                attachments: vec![],
+                cancel_token: None,
+                prior_messages: vec![],
+                context_path: None,
+            })
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            Err(NativeHarnessError::ModelOther(msg)) => {
+                assert!(msg.contains("silent_stop"));
+                assert!(msg.contains("stop_reason=max_tokens"));
+            }
+            other => panic!("expected silent_stop model error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1753,8 +1857,14 @@ mod tests {
                 assert!(err.contains("missing required field `path`"), "{err}");
                 assert!(err.contains("Received fields: content"));
                 assert!(err.contains("string(20000 chars"));
-                assert!(err.contains("Expected shape"), "teaching example missing: {err}");
-                assert!(!err.contains(&"x".repeat(2000)), "error should not echo full content");
+                assert!(
+                    err.contains("Expected shape"),
+                    "teaching example missing: {err}"
+                );
+                assert!(
+                    !err.contains(&"x".repeat(2000)),
+                    "error should not echo full content"
+                );
             }
             other => panic!("expected invalid-input ToolResult, got {other:?}"),
         }

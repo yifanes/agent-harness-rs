@@ -50,5 +50,5 @@ impl ApprovalGate for PlanApproval {
 }
 
 pub(crate) fn is_read_only(name: &str) -> bool {
-    matches!(name, "read" | "glob" | "grep")
+    matches!(name, "read" | "glob" | "grep" | "web_fetch")
 }

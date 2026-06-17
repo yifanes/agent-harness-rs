@@ -577,6 +577,7 @@ impl ToolRuntime for E2bToolRuntime {
             "edit"  => self.e2b_edit(inv).await,
             "glob"  => self.e2b_glob(inv).await,
             "grep"  => self.e2b_grep(inv).await,
+            "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
             other   => Err(ToolRuntimeError::UnknownTool(other.into())),
         }
     }

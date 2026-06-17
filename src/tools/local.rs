@@ -141,6 +141,7 @@ impl ToolRuntime for LocalToolRuntime {
             "edit"  => edit_invoke(inv, self).await,
             "glob"  => glob_invoke(inv, self).await,
             "grep"  => grep_invoke(inv, self).await,
+            "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
             other   => Err(ToolRuntimeError::UnknownTool(other.into())),
         }
     }

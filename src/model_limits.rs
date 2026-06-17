@@ -114,7 +114,10 @@ static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
 fn catalog() -> &'static RwLock<CatalogState> {
     CATALOG.get_or_init(|| {
         RwLock::new(CatalogState {
+            #[cfg(not(test))]
             table: load_disk_cache_into_memory(),
+            #[cfg(test)]
+            table: HashMap::new(),
             fetch_attempted: false,
         })
     })
@@ -174,7 +177,14 @@ pub fn resolve_limits(model: &str) -> ModelLimits {
             }
         };
         if let Some(limits) = guard.table.get(&model.to_ascii_lowercase()) {
-            return *limits;
+            let fallback = fallback_table_lookup(model);
+            if fallback == ModelLimits::default_fallback() {
+                return *limits;
+            }
+            return ModelLimits {
+                context: limits.context.max(fallback.context),
+                output: limits.output.max(fallback.output),
+            };
         }
         let attempted = guard.fetch_attempted;
         drop(guard);

@@ -338,6 +338,7 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
             system_prompt: ctx.system_prompt.clone(),
             messages: summarize_messages,
             tools: ctx.tools.clone(),
+            hosted_tools: vec![],
             tool_choice: crate::model::ToolChoice::Auto,
             parallel_tool_calls: None,
         };

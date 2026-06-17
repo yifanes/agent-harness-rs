@@ -158,6 +158,7 @@ impl<E: SandboxExecutor + Clone + Send + Sync + 'static> ToolRuntime for Sandbox
             "edit"  => self.sandbox_edit(inv).await,
             "glob"  => self.sandbox_glob(inv).await,
             "grep"  => self.sandbox_grep(inv).await,
+            "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
             other   => Err(ToolRuntimeError::UnknownTool(other.into())),
         }
     }

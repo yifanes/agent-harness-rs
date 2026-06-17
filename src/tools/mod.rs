@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod bounded;
 pub mod sandbox;
+pub mod web_fetch;
 
 #[cfg(feature = "local-tools")]
 pub mod local;
@@ -146,7 +147,11 @@ fn summarize_value(value: &Value) -> String {
         Value::String(s) => {
             let preview: String = s.chars().take(80).collect();
             let suffix = if s.chars().count() > 80 { "..." } else { "" };
-            format!("string({} chars, preview={:?}{suffix})", s.chars().count(), preview)
+            format!(
+                "string({} chars, preview={:?}{suffix})",
+                s.chars().count(),
+                preview
+            )
         }
         Value::Array(a) => format!("array({} items)", a.len()),
         Value::Object(o) => format!("object({} keys)", o.len()),
@@ -411,6 +416,18 @@ impl ToolRuntime for MockToolRuntime {
                     attachments: vec![],
                 })
             }
+            "web_fetch" => Ok(ToolOutcome {
+                output: Ok(json!({
+                    "url": invocation.input.get("url").and_then(Value::as_str).unwrap_or(""),
+                    "final_url": invocation.input.get("url").and_then(Value::as_str).unwrap_or(""),
+                    "status": 200,
+                    "content_type": "text/plain",
+                    "format": invocation.input.get("format").and_then(Value::as_str).unwrap_or("markdown"),
+                    "content": "mock web_fetch response",
+                    "truncated": false,
+                })),
+                attachments: vec![],
+            }),
             other => Err(ToolRuntimeError::UnknownTool(other.into())),
         }
     }
@@ -1057,6 +1074,42 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        ToolSpec {
+            name: "web_fetch".into(),
+            description:
+                "Fetch a known HTTP/HTTPS URL and return readable content. This is read-only \
+                 and does not search the web; use it when the user supplies a URL or another \
+                 tool has produced URLs. HTML can be returned as markdown, plain text, or raw HTML."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP or HTTPS URL to fetch."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["markdown", "text", "html"],
+                        "description": "Return format. Defaults to markdown."
+                    },
+                    "max_length": {
+                        "type": "integer",
+                        "description": "Maximum characters of content to return (default 50000, max 200000).",
+                        "minimum": 1,
+                        "maximum": 200000
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Request timeout in milliseconds (default 20000, max 60000).",
+                        "minimum": 1000,
+                        "maximum": 60000
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -1094,7 +1147,10 @@ mod tests {
         s.push_str("LAST_LINE_NO_MARKER");
         let preview = bounded_preview(&s, "/tmp/out.txt").expect("over budget");
         assert!(preview.contains("HEAD_MARKER"));
-        assert!(!preview.contains("LAST_LINE_NO_MARKER"), "tail leaked in head-only mode");
+        assert!(
+            !preview.contains("LAST_LINE_NO_MARKER"),
+            "tail leaked in head-only mode"
+        );
         assert!(preview.contains("/tmp/out.txt"));
         assert!(preview.contains("truncated"));
     }
@@ -1277,7 +1333,10 @@ mod tests {
         assert_eq!(out["replaced"], 1);
         // Repair is silent: the success output must NOT surface a `repair`
         // field to the model (MiMoCode "success silent" policy).
-        assert!(out.get("repair").is_none(), "repair leaked into output: {out}");
+        assert!(
+            out.get("repair").is_none(),
+            "repair leaked into output: {out}"
+        );
         let after = rt
             .invoke(ToolInvocation {
                 id: "tc_read".into(),
