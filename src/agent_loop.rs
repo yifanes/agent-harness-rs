@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::stream::StreamExt;
+use futures::{stream::StreamExt, FutureExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -164,7 +164,8 @@ where
         let stream_max_attempts = self.stream_max_attempts;
 
         tokio::spawn(async move {
-            run_loop(
+            let tx_for_panic = tx.clone();
+            let result = std::panic::AssertUnwindSafe(run_loop(
                 model,
                 tools,
                 RunLoopConfig {
@@ -178,8 +179,22 @@ where
                 },
                 input,
                 tx,
-            )
+            ))
+            .catch_unwind()
             .await;
+            if let Err(payload) = result {
+                let detail = panic_payload_to_string(payload.as_ref());
+                tracing::error!(
+                    target: "harness::agent_loop",
+                    panic = %detail,
+                    "native agent loop panicked"
+                );
+                let _ = tx_for_panic
+                    .send(Err(NativeHarnessError::Failed(format!(
+                        "agent loop panicked: {detail}"
+                    ))))
+                    .await;
+            }
         });
 
         Ok(rx)
@@ -262,7 +277,11 @@ async fn run_loop<M, R>(
                     .send(Ok(HarnessInternalEvent::TurnEnd {
                         stop_reason: "interrupt".into(),
                         usage: saw_any_usage.then(|| total_usage.clone()),
-                        final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
+                        final_messages: if context_path.is_none() {
+                            messages.clone()
+                        } else {
+                            vec![]
+                        },
                     }))
                     .await;
                 return;
@@ -447,7 +466,11 @@ async fn run_loop<M, R>(
                         .send(Ok(HarnessInternalEvent::TurnEnd {
                             stop_reason: "interrupt".into(),
                             usage: saw_any_usage.then(|| total_usage.clone()),
-                            final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
+                            final_messages: if context_path.is_none() {
+                                messages.clone()
+                            } else {
+                                vec![]
+                            },
                         }))
                         .await;
                     return;
@@ -531,7 +554,11 @@ async fn run_loop<M, R>(
                 }
                 // Note: AssistantTextChunk events were already emitted
                 // mid-stream, so there's nothing more to send here.
-                let final_msgs = if context_path.is_none() { messages.clone() } else { vec![] };
+                let final_msgs = if context_path.is_none() {
+                    messages.clone()
+                } else {
+                    vec![]
+                };
                 let _ = tx
                     .send(Ok(HarnessInternalEvent::TurnEnd {
                         stop_reason,
@@ -646,7 +673,11 @@ async fn run_loop<M, R>(
                             .send(Ok(HarnessInternalEvent::TurnEnd {
                                 stop_reason: "interrupt".into(),
                                 usage: saw_any_usage.then(|| total_usage.clone()),
-                                final_messages: if context_path.is_none() { messages.clone() } else { vec![] },
+                                final_messages: if context_path.is_none() {
+                                    messages.clone()
+                                } else {
+                                    vec![]
+                                },
                             }))
                             .await;
                         return;
@@ -654,38 +685,46 @@ async fn run_loop<M, R>(
                 };
 
                 // Walk invocations + outcomes pairwise to keep ordering
-                // stable. Tool timeouts and invalid model-supplied inputs are
-                // model-observable failures; infrastructure/runtime errors
-                // still fail the turn.
-                let mut runtime_error: Option<String> = None;
+                // stable. Tool failures are model-observable: the model can
+                // retry with better input or choose a different approach, and
+                // the harness must not disappear behind a missing terminal.
                 for (inv, outcome) in pairs {
                     let id = inv.id.clone();
                     let outcome = match outcome {
-                        Ok(o) => o,
-                        Err(ToolRuntimeError::Timeout(message)) => ToolOutcome {
-                            output: Err(ToolFailure::new(ToolFailureKind::Timeout, message)),
-                            attachments: vec![],
-                        },
-                        Err(ToolRuntimeError::InvalidInput { tool, message }) => ToolOutcome {
-                            output: Err(crate::tools::invalid_input_failure(
-                                &tool,
-                                message,
-                                &inv.input,
+                        Ok(o) => {
+                            tracing::info!(
+                                target: "harness::tool",
+                                step,
+                                tool = %inv.name,
+                                id = %id,
+                                success = o.output.is_ok(),
+                                attachments = o.attachments.len(),
+                                "tool invocation completed"
+                            );
+                            o
+                        }
+                        Err(e) => {
+                            let failure = tool_runtime_error_to_failure(
+                                &inv,
+                                e,
                                 tools_snapshot
                                     .iter()
-                                    .find(|s| s.name == tool)
+                                    .find(|s| s.name == inv.name)
                                     .map(|s| &s.input_schema),
-                            )),
-                            attachments: vec![],
-                        },
-                        Err(e) => {
-                            // Note: ToolRuntimeError vs ToolFailure are
-                            // different beasts. ToolFailure is model-
-                            // observable (file not found, exit≠0); this
-                            // is sandbox / runtime infrastructure
-                            // breaking and HR needs to know.
-                            runtime_error = Some(e.to_string());
-                            break;
+                            );
+                            tracing::warn!(
+                                target: "harness::tool",
+                                step,
+                                tool = %inv.name,
+                                id = %id,
+                                failure_kind = ?failure.kind,
+                                failure_message = %failure.message,
+                                "tool invocation failed; returning model-visible ToolResult"
+                            );
+                            ToolOutcome {
+                                output: Err(failure),
+                                attachments: vec![],
+                            }
                         }
                     };
                     let tool_attachments = outcome.attachments;
@@ -715,10 +754,6 @@ async fn run_loop<M, R>(
                         return;
                     }
                 }
-                if let Some(err) = runtime_error {
-                    let _ = tx.send(Err(NativeHarnessError::ToolRuntime(err))).await;
-                    return;
-                }
                 // Flush the Assistant + all Tool messages for this step.
                 if let Some(ref path) = context_path {
                     crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
@@ -734,7 +769,11 @@ async fn run_loop<M, R>(
     if let Some(ref path) = context_path {
         crate::context::jsonl::append_context(path, &messages[ctx_written..]).await;
     }
-    let final_msgs = if context_path.is_none() { messages } else { vec![] };
+    let final_msgs = if context_path.is_none() {
+        messages
+    } else {
+        vec![]
+    };
     let _ = tx
         .send(Ok(HarnessInternalEvent::TurnEnd {
             stop_reason: "max_turns".into(),
@@ -779,6 +818,34 @@ fn model_error_to_native(err: ModelClientError) -> NativeHarnessError {
         ModelClientError::ServerError(s) => NativeHarnessError::ModelServerError(s),
         ModelClientError::Network(s) => NativeHarnessError::ModelNetwork(s),
         ModelClientError::Other(s) => NativeHarnessError::ModelOther(s),
+    }
+}
+
+fn tool_runtime_error_to_failure(
+    inv: &ToolInvocation,
+    err: ToolRuntimeError,
+    schema: Option<&serde_json::Value>,
+) -> ToolFailure {
+    match err {
+        ToolRuntimeError::Timeout(message) => ToolFailure::new(ToolFailureKind::Timeout, message),
+        ToolRuntimeError::InvalidInput { tool, message } => {
+            crate::tools::invalid_input_failure(&tool, message, &inv.input, schema)
+        }
+        ToolRuntimeError::UnknownTool(tool) => ToolFailure::new(
+            ToolFailureKind::InvalidInput,
+            format!("unknown tool {tool}; choose one of the advertised tools"),
+        ),
+        ToolRuntimeError::Runtime(message) => ToolFailure::new(ToolFailureKind::Runtime, message),
+    }
+}
+
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".into()
     }
 }
 
@@ -1791,6 +1858,93 @@ mod tests {
                 assert!(err.contains("tool timed out"));
             }
             other => panic!("expected timeout ToolResult, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            HarnessInternalEvent::AssistantTextChunk { ref delta, .. } if delta == "recovered"
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            HarnessInternalEvent::TurnEnd { ref stop_reason, .. } if stop_reason == "end_turn"
+        ));
+    }
+
+    #[derive(Clone)]
+    struct RuntimeErrorToolRuntime;
+
+    #[async_trait]
+    impl ToolRuntime for RuntimeErrorToolRuntime {
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            vec![crate::tools::ToolSpec {
+                name: "flaky".into(),
+                description: "always returns a runtime failure".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        async fn invoke(
+            &self,
+            _invocation: ToolInvocation,
+        ) -> Result<ToolOutcome, ToolRuntimeError> {
+            Err(ToolRuntimeError::Runtime(
+                "sandbox exec stream closed".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_tool_runtime_error_is_model_observable_result() {
+        let model = StreamingFakeClient::new(vec![
+            vec![
+                ModelChunk::ToolCallStart {
+                    id: "tc_runtime".into(),
+                    name: "flaky".into(),
+                },
+                ModelChunk::ToolCallEnd {
+                    id: "tc_runtime".into(),
+                    input: Some(json!({})),
+                },
+                ModelChunk::Done {
+                    stop_reason: "tool_use".into(),
+                    usage: None,
+                },
+            ],
+            vec![
+                ModelChunk::TextDelta {
+                    msg_id: "r2".into(),
+                    delta: "recovered".into(),
+                },
+                ModelChunk::Done {
+                    stop_reason: "end_turn".into(),
+                    usage: None,
+                },
+            ],
+        ]);
+        let harness = AgentLoopHarness::new(model, RuntimeErrorToolRuntime);
+        let mut rx = harness
+            .run_turn(NativeTurnInput {
+                prompt_text: "run flaky".into(),
+                system_prompt: None,
+                attachments: vec![],
+                cancel_token: None,
+                prior_messages: vec![],
+                context_path: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap().unwrap(),
+            HarnessInternalEvent::ToolCall { .. }
+        ));
+        match rx.recv().await.unwrap().unwrap() {
+            HarnessInternalEvent::ToolResult { id, output } => {
+                assert_eq!(id, "tc_runtime");
+                let err = output.unwrap_err();
+                assert!(err.contains("Runtime"));
+                assert!(err.contains("sandbox exec stream closed"));
+            }
+            other => panic!("expected runtime-error ToolResult, got {other:?}"),
         }
         assert!(matches!(
             rx.recv().await.unwrap().unwrap(),
