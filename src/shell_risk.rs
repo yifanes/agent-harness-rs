@@ -33,6 +33,34 @@
 //!     chains, `sh -c '…'` wrappers) so destructive segments can't hide
 //!     behind syntax that merely fails the safe parse.
 
+/// Environment variable used by [`classify_shell_command`] to select the shell
+/// risk policy.
+///
+/// Set to `relaxed`, `lenient`, or `permissive` to bypass conservative
+/// read-only classification while still enforcing hard-deny checks. Any other
+/// value, or an unset variable, uses [`ShellRiskPolicy::Strict`].
+pub const SHELL_RISK_POLICY_ENV: &str = "AGENT_HARNESS_SHELL_RISK_POLICY";
+
+/// Policy used for static shell-risk classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellRiskPolicy {
+    /// Preserve the conservative static classifier.
+    Strict,
+    /// Temporarily bypass conservative read-only checks while keeping hard-deny
+    /// protection for session-destroying commands.
+    Relaxed,
+}
+
+impl ShellRiskPolicy {
+    /// Resolve the policy from [`SHELL_RISK_POLICY_ENV`].
+    pub fn from_env() -> Self {
+        match std::env::var(SHELL_RISK_POLICY_ENV) {
+            Ok(value) if shell_risk_policy_value_is_relaxed(&value) => ShellRiskPolicy::Relaxed,
+            _ => ShellRiskPolicy::Strict,
+        }
+    }
+}
+
 /// Risk level assigned to a shell command by [`classify_shell_command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRiskLevel {
@@ -95,10 +123,28 @@ fn blocked(reason: &str) -> ShellRiskDecision {
 
 /// Classify a shell command's static risk. See module docs for the levels.
 pub fn classify_shell_command(command: &str) -> ShellRiskDecision {
+    classify_shell_command_with_policy(command, ShellRiskPolicy::from_env())
+}
+
+/// Classify a shell command's static risk with an explicit policy.
+pub fn classify_shell_command_with_policy(
+    command: &str,
+    policy: ShellRiskPolicy,
+) -> ShellRiskDecision {
     if let Some(decision) = hard_deny(command) {
         return decision;
     }
-    classify_allowable(command)
+    match policy {
+        ShellRiskPolicy::Strict => classify_allowable(command),
+        ShellRiskPolicy::Relaxed => safe_read("shell risk policy relaxed"),
+    }
+}
+
+fn shell_risk_policy_value_is_relaxed(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "relaxed" | "lenient" | "permissive"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,6 +2120,23 @@ mod tests {
             ShellRiskLevel::NeedsApproval
         );
         assert_eq!(level("ls && cargo test"), ShellRiskLevel::NeedsApproval);
+    }
+
+    #[test]
+    fn relaxed_policy_bypasses_conservative_read_only_checks() {
+        let command = "curl -sS https://example.com 2>&1 | head -80";
+        assert_eq!(
+            classify_shell_command_with_policy(command, ShellRiskPolicy::Strict).level,
+            ShellRiskLevel::NeedsApproval
+        );
+        assert_eq!(
+            classify_shell_command_with_policy(command, ShellRiskPolicy::Relaxed).level,
+            ShellRiskLevel::SafeRead
+        );
+        assert_eq!(
+            classify_shell_command_with_policy("rm -rf /", ShellRiskPolicy::Relaxed).level,
+            ShellRiskLevel::Blocked
+        );
     }
 
     // --- hard deny --------------------------------------------------------------

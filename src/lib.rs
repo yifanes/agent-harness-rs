@@ -37,7 +37,10 @@ pub use model::{
     ToolChoice, UserAttachment,
 };
 pub use runner::{FakeNativeHarness, NativeHarness, ToolCapableFakeHarness};
-pub use shell_risk::{classify_shell_command, ShellRiskDecision, ShellRiskLevel};
+pub use shell_risk::{
+    classify_shell_command, classify_shell_command_with_policy, ShellRiskDecision, ShellRiskLevel,
+    ShellRiskPolicy, SHELL_RISK_POLICY_ENV,
+};
 pub use skills::{
     parse_skill_frontmatter, LocalSkillSource, SkillError, SkillLoader, SkillMetadata,
     SkillPromptRenderer, SkillSource, SkillsManager,

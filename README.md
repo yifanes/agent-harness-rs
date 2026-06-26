@@ -212,6 +212,19 @@ impl ApprovalGate for MyApproval {
 }
 ```
 
+### Shell risk policy
+
+`bash` commands are normally pre-classified with a conservative static
+read-only checker before the approval gate runs. To temporarily bypass that
+checker while still blocking session-destroying hard-deny commands, set:
+
+```sh
+AGENT_HARNESS_SHELL_RISK_POLICY=relaxed
+```
+
+Accepted relaxed values are `relaxed`, `lenient`, and `permissive`. Leave the
+variable unset for the default strict behavior.
+
 ## License
 
 MIT

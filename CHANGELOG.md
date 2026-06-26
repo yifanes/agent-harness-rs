@@ -4,6 +4,13 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.7] - 2026-06-26
+
+### Added
+
+- Added `AGENT_HARNESS_SHELL_RISK_POLICY=relaxed` to temporarily bypass
+  conservative bash read-only classification while preserving hard-deny checks.
+
 ## [0.2.6] - 2026-06-17
 
 ### Added
