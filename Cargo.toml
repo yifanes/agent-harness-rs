@@ -1,6 +1,6 @@
 [package]
 name = "agent-harness-rs"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 authors = ["yifanes"]
 license = "MIT"
@@ -30,6 +30,7 @@ eventsource-stream = "0.2"
 tracing            = "0.1"
 uuid               = { version = "1", features = ["v4"] }
 base64             = "0.22"
+libc               = "0.2"
 
 # e2b feature: Connect Protocol to envd
 prost   = { version = "0.13", optional = true }

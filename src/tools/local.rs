@@ -156,6 +156,92 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+const CANCEL_TERMINATION_GRACE: Duration = Duration::from_millis(50);
+const CHILD_WAIT_AFTER_KILL: Duration = Duration::from_millis(500);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+enum BashCompletion {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    SoftTimeout { total_ms: u64, silent_ms: u64 },
+    HardTimeout,
+    Cancelled,
+}
+
+async fn drain_output_tasks(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+) {
+    let drain = async {
+        let _ = (&mut stdout_task).await;
+        let _ = (&mut stderr_task).await;
+    };
+
+    if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, drain).await.is_err() {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group_id: u32, signal: libc::c_int) {
+    let pgid = process_group_id as libc::pid_t;
+    if pgid <= 0 {
+        return;
+    }
+
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc == 0 {
+        return;
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ESRCH) {
+        tracing::debug!(
+            process_group_id,
+            signal,
+            error = %err,
+            "failed to signal bash process group"
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn kill_process_group(process_group_id: u32, child: &mut tokio::process::Child) {
+    signal_process_group(process_group_id, libc::SIGKILL);
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(CHILD_WAIT_AFTER_KILL, child.wait()).await;
+}
+
+#[cfg(not(unix))]
+async fn kill_process_group(_: u32, child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(CHILD_WAIT_AFTER_KILL, child.wait()).await;
+}
+
+#[cfg(unix)]
+async fn terminate_process_group(process_group_id: u32, child: &mut tokio::process::Child) {
+    signal_process_group(process_group_id, libc::SIGTERM);
+
+    let child_exited =
+        tokio::time::timeout(CANCEL_TERMINATION_GRACE, child.wait()).await.is_ok();
+
+    // Match Codex's cancellation behavior: give the shell a short SIGTERM
+    // cleanup window, then SIGKILL the group so TERM-ignoring descendants do
+    // not survive after the parent exits.
+    signal_process_group(process_group_id, libc::SIGKILL);
+    if !child_exited {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(CHILD_WAIT_AFTER_KILL, child.wait()).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_group(_: u32, child: &mut tokio::process::Child) {
+    kill_process_group(0, child).await;
+}
+
 async fn bash_invoke(
     inv: ToolInvocation,
     cancel: Option<&CancellationToken>,
@@ -184,14 +270,20 @@ async fn bash_invoke(
     let stderr_buf = Arc::new(Mutex::new(String::new()));
 
     let shell = if Path::new("/bin/bash").exists() { "/bin/bash" } else { "/bin/sh" };
-    let mut child = Command::new(shell)
-        .args(["-lc", command])
+    let mut cmd = Command::new(shell);
+    cmd.args(["-lc", command])
         .current_dir(cwd)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| ToolRuntimeError::Runtime(format!("spawn failed: {e}")))?;
+    let child_pid = child.id();
 
     let raw_stdout = child.stdout.take().expect("stdout piped");
     let raw_stderr = child.stderr.take().expect("stderr piped");
@@ -201,18 +293,14 @@ async fn bash_invoke(
     let stdout_acc = stdout_buf.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(raw_stdout).lines();
-        let mut buf = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
             emit_out(json!({ "type": "bash_stdout_line", "line": line, "stream": "stdout" }));
             act1.store(epoch_ms(), Ordering::Relaxed);
-            buf.push_str(&line);
-            buf.push('\n');
             if let Ok(mut acc) = stdout_acc.lock() {
                 acc.push_str(&line);
                 acc.push('\n');
             }
         }
-        buf
     });
 
     let act2 = last_out.clone();
@@ -220,18 +308,14 @@ async fn bash_invoke(
     let stderr_acc = stderr_buf.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(raw_stderr).lines();
-        let mut buf = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
             emit_err(json!({ "type": "bash_stdout_line", "line": line, "stream": "stderr" }));
             act2.store(epoch_ms(), Ordering::Relaxed);
-            buf.push_str(&line);
-            buf.push('\n');
             if let Ok(mut acc) = stderr_acc.lock() {
                 acc.push_str(&line);
                 acc.push('\n');
             }
         }
-        buf
     });
 
     let watcher_ts = last_out.clone();
@@ -248,16 +332,14 @@ async fn bash_invoke(
         }
     };
 
-    let timed = async {
-        let (out, err) = tokio::join!(
-            async { stdout_task.await.unwrap_or_default() },
-            async { stderr_task.await.unwrap_or_default() },
-        );
-        let status = child.wait().await;
-        (out, err, status)
-    };
-
     let hard_timer = tokio::time::sleep(Duration::from_millis(hard_ms));
+    let cancellation = async {
+        if let Some(tok) = cancel {
+            tok.cancelled().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
 
     let timeout_outcome = |kind: &str, message: String| ToolOutcome {
         output: Ok(json!({
@@ -287,28 +369,45 @@ Retry with larger `soft_timeout_ms` or `timeout_ms` if it is expected to take lo
         ),
     );
 
-    let result: Result<(String, String, _), ToolOutcome> = if let Some(tok) = cancel {
-        tokio::select! {
-            v = timed => Ok(v),
-            (tot, sil) = soft_watcher => Err(soft_err(tot, sil)),
-            _ = hard_timer => Err(hard_err()),
-            _ = tok.cancelled() => Err(ToolOutcome {
+    let completion = tokio::select! {
+        biased;
+        _ = cancellation => BashCompletion::Cancelled,
+        status = child.wait() => BashCompletion::Exited(status),
+        (tot, sil) = soft_watcher => BashCompletion::SoftTimeout { total_ms: tot, silent_ms: sil },
+        _ = hard_timer => BashCompletion::HardTimeout,
+    };
+
+    let status_result = match completion {
+        BashCompletion::Exited(status) => status,
+        BashCompletion::SoftTimeout { total_ms, silent_ms } => {
+            if let Some(pid) = child_pid {
+                kill_process_group(pid, &mut child).await;
+            }
+            drain_output_tasks(stdout_task, stderr_task).await;
+            return Ok(soft_err(total_ms, silent_ms));
+        }
+        BashCompletion::HardTimeout => {
+            if let Some(pid) = child_pid {
+                kill_process_group(pid, &mut child).await;
+            }
+            drain_output_tasks(stdout_task, stderr_task).await;
+            return Ok(hard_err());
+        }
+        BashCompletion::Cancelled => {
+            if let Some(pid) = child_pid {
+                terminate_process_group(pid, &mut child).await;
+            }
+            drain_output_tasks(stdout_task, stderr_task).await;
+            return Ok(ToolOutcome {
                 output: Err(ToolFailure::new(ToolFailureKind::Runtime, "cancelled")),
                 attachments: vec![],
-            }),
-        }
-    } else {
-        tokio::select! {
-            v = timed => Ok(v),
-            (tot, sil) = soft_watcher => Err(soft_err(tot, sil)),
-            _ = hard_timer => Err(hard_err()),
+            });
         }
     };
 
-    let (stdout, stderr, status_result) = match result {
-        Err(outcome) => return Ok(outcome),
-        Ok(v) => v,
-    };
+    drain_output_tasks(stdout_task, stderr_task).await;
+    let stdout = stdout_buf.lock().map(|s| s.clone()).unwrap_or_default();
+    let stderr = stderr_buf.lock().map(|s| s.clone()).unwrap_or_default();
 
     let exit_code = status_result.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
@@ -571,6 +670,52 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    async fn processes_matching_marker(marker: &str) -> Vec<(libc::pid_t, libc::pid_t, String)> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,pgid=,command="])
+            .output()
+            .await
+            .expect("ps should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains(marker))
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let pid = parts.next()?.parse().ok()?;
+                let pgid = parts.next()?.parse().ok()?;
+                let command = parts.collect::<Vec<_>>().join(" ");
+                Some((pid, pgid, command))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_marker_processes(marker: &str) {
+        for (_, pgid, _) in processes_matching_marker(marker).await {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_marker_process(marker: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !processes_matching_marker(marker).await.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     #[tokio::test]
     async fn bash_non_zero_exit_returns_structured_result() {
         let out = runtime()
@@ -607,6 +752,100 @@ mod tests {
         assert_eq!(out["success"], false);
         assert_eq!(out["timed_out"], true);
         assert_eq!(out["timeout_kind"], "soft");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_process_group_children() {
+        let marker = format!("harness-timeout-pgid-{}", epoch_ms());
+        cleanup_marker_processes(&marker).await;
+
+        let command = format!("sh -c 'while :; do sleep 5; done' {marker} & wait");
+        let out = runtime()
+            .invoke(ToolInvocation {
+                id: "tc_timeout_pgid".into(),
+                name: "bash".into(),
+                input: json!({
+                    "command": command,
+                    "soft_timeout_ms": 200,
+                    "timeout_ms": 5000
+                }),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(out["success"], false);
+        assert_eq!(out["timed_out"], true);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leftovers = processes_matching_marker(&marker).await;
+        cleanup_marker_processes(&marker).await;
+        assert!(
+            leftovers.is_empty(),
+            "timeout left child processes running: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_cancel_sends_sigterm_then_kills_process_group_children() {
+        let marker = format!("harness-cancel-pgid-{}", epoch_ms());
+        let cleanup_path = std::env::temp_dir().join(format!("{marker}.cleanup"));
+        let _ = tokio::fs::remove_file(&cleanup_path).await;
+        cleanup_marker_processes(&marker).await;
+
+        let command = format!(
+            r#"trap "printf cleanup > {}; exit 0" TERM; sh -c 'trap "" TERM; while :; do sleep 5; done' {} & wait"#,
+            shell_quote(&cleanup_path.to_string_lossy()),
+            shell_quote(&marker),
+        );
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            runtime()
+                .invoke_cancellable(
+                    ToolInvocation {
+                        id: "tc_cancel_pgid".into(),
+                        name: "bash".into(),
+                        input: json!({
+                            "command": command,
+                            "soft_timeout_ms": 5000,
+                            "timeout_ms": 10000
+                        }),
+                    },
+                    Some(&cancel_for_task),
+                )
+                .await
+        });
+
+        assert!(
+            wait_for_marker_process(&marker).await,
+            "test command did not start"
+        );
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("cancelled bash invocation should return promptly")
+            .expect("join should succeed")
+            .expect("runtime should return a ToolOutcome");
+        let failure = outcome.output.expect_err("cancel should be surfaced as failure");
+        assert_eq!(failure.kind, ToolFailureKind::Runtime);
+        assert_eq!(failure.message, "cancelled");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            cleanup_path.exists(),
+            "parent shell did not get SIGTERM cleanup window"
+        );
+        let leftovers = processes_matching_marker(&marker).await;
+        cleanup_marker_processes(&marker).await;
+        let _ = tokio::fs::remove_file(&cleanup_path).await;
+        assert!(
+            leftovers.is_empty(),
+            "cancel left child processes running: {leftovers:?}"
+        );
     }
 
     #[tokio::test]
