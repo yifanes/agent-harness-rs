@@ -547,6 +547,7 @@ async fn run_loop<M, R>(
                     text: assistant_text,
                     tool_calls: vec![],
                     thinking: outcome.thinking.clone(),
+                    usage: outcome.usage.clone(),
                 });
                 // Persist the final Assistant message to context JSONL.
                 if let Some(ref path) = context_path {
@@ -607,6 +608,7 @@ async fn run_loop<M, R>(
                     text: preface_text,
                     tool_calls: invocations.clone(),
                     thinking: outcome.thinking.clone(),
+                    usage: outcome.usage.clone(),
                 });
 
                 // Preface AssistantTextChunk was already emitted mid-stream.
@@ -2683,6 +2685,7 @@ mod tests {
                 text: Some("first reply".into()),
                 tool_calls: vec![],
                 thinking: None,
+                usage: None,
             },
         ];
         let mut rx = harness

@@ -73,6 +73,7 @@ pub fn sanitize_history(messages: Vec<ChatMessage>) -> (Vec<ChatMessage>, Saniti
                 tool_calls,
                 text,
                 thinking,
+                usage,
             } if !tool_calls.is_empty() => {
                 // Repair blank ids, then push the assistant message.
                 let mut repaired_calls = tool_calls.clone();
@@ -88,6 +89,7 @@ pub fn sanitize_history(messages: Vec<ChatMessage>) -> (Vec<ChatMessage>, Saniti
                     text: text.clone(),
                     tool_calls: repaired_calls,
                     thinking: thinking.clone(),
+                    usage: usage.clone(),
                 });
 
                 // Pair each expected id with a following tool message (in
@@ -176,6 +178,7 @@ mod tests {
                 })
                 .collect(),
             thinking: None,
+            usage: None,
         }
     }
 
@@ -207,6 +210,7 @@ mod tests {
                 text: Some("done".into()),
                 tool_calls: vec![],
                 thinking: None,
+                usage: None,
             },
         ];
         let (out, diag) = sanitize_history(msgs.clone());
@@ -290,6 +294,7 @@ mod tests {
                 text: "ponder".into(),
                 signature: Some("sig".into()),
             }),
+            usage: None,
         };
         let (out, diag) = sanitize_history(vec![msg.clone()]);
         assert!(diag.is_clean());

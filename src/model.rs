@@ -133,6 +133,13 @@ pub enum ChatMessage {
         /// Thinking block to round-trip verbatim. `None` for OpenAI /
         /// Anthropic-without-extended-thinking turns.
         thinking: Option<AssistantThinking>,
+        /// Provider-reported token tally for this assistant turn, when the
+        /// provider supplied one. Records the exact context size up to and
+        /// including this message, so context-size estimation can anchor on
+        /// a measured value and estimate only the messages appended after it.
+        /// `None` when the turn carried no reported usage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::event::HarnessUsage>,
     },
     /// Tool response paired by `tool_call_id`. `content` is the
     /// serialized tool output (model side sees a string regardless of
@@ -695,6 +702,7 @@ fn chat_message_to_wire(msg: &ChatMessage) -> Value {
             text,
             tool_calls,
             thinking: _,
+            usage: _,
         } => {
             // OpenAI chat/completions has no equivalent of Anthropic
             // thinking blocks; we drop the field here. The Anthropic
@@ -1467,6 +1475,7 @@ fn chat_messages_to_anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 text,
                 tool_calls,
                 thinking,
+                usage: _,
             } => {
                 // tool_results must be flushed before we can append an
                 // assistant message (Anthropic rejects two consecutive
@@ -2540,6 +2549,7 @@ mod tests {
                     input: json!({}),
                 }],
                 thinking: None,
+                usage: None,
             },
             ChatMessage::Tool {
                 tool_call_id: "tc_big".into(),
@@ -2568,6 +2578,7 @@ mod tests {
                     input: json!({}),
                 }],
                 thinking: None,
+                usage: None,
             },
             ChatMessage::Tool {
                 tool_call_id: "tc_img".into(),
@@ -2653,6 +2664,7 @@ mod tests {
                     input: json!({}),
                 }],
                 thinking: None,
+                usage: None,
             },
             ChatMessage::Tool {
                 tool_call_id: "tc_1".into(),
@@ -2691,6 +2703,7 @@ mod tests {
                 text: Some("hello".into()),
                 tool_calls: vec![],
                 thinking: None,
+                usage: None,
             },
         ];
         let out = chat_messages_to_anthropic_messages(&msgs);
@@ -2720,6 +2733,7 @@ mod tests {
                     input: json!({"command": "pwd"}),
                 }],
                 thinking: None,
+                usage: None,
             },
             ChatMessage::Tool {
                 tool_call_id: "call_1".into(),
@@ -2758,6 +2772,7 @@ mod tests {
                 text: "deep thought".into(),
                 signature: Some("sig123".into()),
             }),
+            usage: None,
         }];
         let out = chat_messages_to_anthropic_messages(&msgs);
         let blocks = out[0]["content"].as_array().unwrap();
@@ -2783,6 +2798,7 @@ mod tests {
                     input: json!({}),
                 }],
                 thinking: None,
+                usage: None,
             },
             ChatMessage::Tool {
                 tool_call_id: "t".into(),
@@ -3271,6 +3287,7 @@ mod tests {
                         input: json!({"command": "pwd"}),
                     }],
                     thinking: None,
+                    usage: None,
                 },
                 ChatMessage::Tool {
                     tool_call_id: "call_1".into(),
@@ -3322,6 +3339,7 @@ mod tests {
                     text: None,
                     tool_calls: vec![invocation.clone()],
                     thinking: None,
+                    usage: None,
                 },
                 ChatMessage::Tool {
                     tool_call_id: invocation.id.clone(),

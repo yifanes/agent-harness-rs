@@ -10,7 +10,7 @@ use crate::model::{ChatMessage, UserAttachment};
 /// Kept independent of any wire format (no `grpc::*` import) so the harness
 /// crate stays a pure domain library. The `core::native_adapter` layer
 /// converts this to the proto `SessionUsage` shape on the way out.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HarnessUsage {
     /// Total input tokens spent this turn (main steps + compaction
     /// summarize calls combined). Same field the wire `SessionUsage`

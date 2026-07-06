@@ -27,6 +27,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::event::HarnessUsage;
 use crate::model::{
     collect_model_response, ChatMessage, ModelClient, ModelClientError, ModelResponse,
     ModelTurnInput,
@@ -106,6 +107,7 @@ pub fn estimate_chat_message_tokens(m: &ChatMessage) -> u64 {
             text,
             tool_calls,
             thinking,
+            usage: _,
         } => {
             let text_tokens = text.as_deref().map(estimate_tokens).unwrap_or(0);
             let tc_tokens: u64 = tool_calls
@@ -130,6 +132,52 @@ pub fn estimate_chat_message_tokens(m: &ChatMessage) -> u64 {
 /// only look at the rendered text / JSON size, not the wire shape.
 pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(estimate_chat_message_tokens).sum()
+}
+
+/// Reduce a reported usage tally to a single context-size figure: the
+/// tokens the provider counted as present on input for that turn. Cache
+/// reads count toward the window occupancy just like fresh input, so they
+/// are included; output is excluded because it is emitted after the input
+/// window is measured (the emitted output only occupies the window on the
+/// *next* turn, where it appears as a later message we estimate directly).
+fn usage_context_tokens(u: &HarnessUsage) -> u64 {
+    u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+}
+
+/// Estimate the total context size of `messages`, anchoring on the last
+/// assistant turn that carried a provider-reported usage tally.
+///
+/// The provider's reported input count is the exact number of tokens the
+/// model saw up to and including that turn — system prompt, tools, and all
+/// prior messages combined. Re-estimating that prefix by character count
+/// drifts (often by thousands of tokens) as a conversation grows, which
+/// skews the compaction trigger. So the newest usage-bearing assistant
+/// message is treated as ground truth for everything at or before it, and
+/// only the messages appended after it are estimated heuristically.
+///
+/// With no usage anywhere (first turn, or a client that never reports it)
+/// this falls back to a full heuristic sum, matching
+/// [`estimate_messages_tokens`].
+pub fn estimate_context_tokens_anchored(messages: &[ChatMessage]) -> u64 {
+    let anchor = messages.iter().enumerate().rev().find_map(|(idx, m)| {
+        match m {
+            ChatMessage::Assistant {
+                usage: Some(u), ..
+            } => Some((idx, usage_context_tokens(u))),
+            _ => None,
+        }
+    });
+
+    match anchor {
+        Some((idx, measured)) => {
+            let tail: u64 = messages[idx + 1..]
+                .iter()
+                .map(estimate_chat_message_tokens)
+                .sum();
+            measured + tail
+        }
+        None => estimate_messages_tokens(messages),
+    }
 }
 
 /// Per-model context window in tokens. Delegates to
@@ -273,7 +321,7 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
         if messages.len() <= self.tail_min_messages {
             return false;
         }
-        let tokens = estimate_messages_tokens(messages);
+        let tokens = estimate_context_tokens_anchored(messages);
         let threshold = ((context_window_tokens as f64) * self.trigger_fraction).round() as u64;
         tokens > threshold
     }
@@ -307,7 +355,12 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
                 freed_tokens,
                 "prune pass freed tokens"
             );
-            let tokens_after_prune = estimate_messages_tokens(&messages);
+            // The usage anchor was measured before pruning and pruning only
+            // rewrites tool outputs that sit before it, so the anchored figure
+            // still reflects the pre-prune size; subtract what pruning freed
+            // to get the current size without re-summing the whole history.
+            let tokens_after_prune =
+                estimate_context_tokens_anchored(&messages).saturating_sub(freed_tokens);
             if tokens_after_prune <= threshold {
                 tracing::info!(
                     target: "harness::compaction",
@@ -595,6 +648,7 @@ mod tests {
             text: Some(s.into()),
             tool_calls: vec![],
             thinking: None,
+            usage: None,
         }
     }
 
@@ -652,8 +706,67 @@ mod tests {
                 input: serde_json::json!({"command": "echo lots of bytes here for sure"}),
             }],
             thinking: None,
+            usage: None,
         };
         assert!(estimate_chat_message_tokens(&with_tool) > estimate_chat_message_tokens(&bare));
+    }
+
+    fn assistant_with_usage(text: &str, input: u64, cache_read: u64) -> ChatMessage {
+        ChatMessage::Assistant {
+            text: Some(text.into()),
+            tool_calls: vec![],
+            thinking: None,
+            usage: Some(HarnessUsage {
+                input_tokens: input,
+                cache_read_input_tokens: cache_read,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn anchored_estimate_uses_reported_usage_for_prefix() {
+        // A short character-count prefix, but the assistant turn reports a
+        // large measured input. The anchor must dominate, plus the tail.
+        let msgs = vec![
+            user("hi"),
+            assistant_with_usage("ok", 40_000, 0),
+            user(&"x".repeat(4000)), // ~1000 tokens tail
+        ];
+        let tail = estimate_chat_message_tokens(&msgs[2]);
+        assert_eq!(estimate_context_tokens_anchored(&msgs), 40_000 + tail);
+    }
+
+    #[test]
+    fn anchored_estimate_counts_cache_reads_toward_window() {
+        // Cache-read tokens still occupy the context window.
+        let msgs = vec![assistant_with_usage("ok", 10_000, 25_000)];
+        assert_eq!(estimate_context_tokens_anchored(&msgs), 35_000);
+    }
+
+    #[test]
+    fn anchored_estimate_picks_newest_usage_anchor() {
+        // Two usage-bearing turns; the newest one wins and everything at or
+        // before it is covered by its measured count.
+        let msgs = vec![
+            user("a"),
+            assistant_with_usage("first", 10_000, 0),
+            user("b"),
+            assistant_with_usage("second", 30_000, 0),
+            user("tail"),
+        ];
+        let tail = estimate_chat_message_tokens(&msgs[4]);
+        assert_eq!(estimate_context_tokens_anchored(&msgs), 30_000 + tail);
+    }
+
+    #[test]
+    fn anchored_estimate_falls_back_without_usage() {
+        // No usage anywhere ⇒ identical to the full heuristic sum.
+        let msgs = vec![user("hi"), assistant_text("there"), user("more")];
+        assert_eq!(
+            estimate_context_tokens_anchored(&msgs),
+            estimate_messages_tokens(&msgs)
+        );
     }
 
     #[test]
