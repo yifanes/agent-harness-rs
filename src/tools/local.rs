@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::shell_risk::{classify_shell_command, ShellRiskLevel};
 use crate::tools::{
-    builtin_tool_specs, fs_glob_bounded, ToolFailure, ToolFailureKind, ToolInvocation,
-    ToolOutcome, ToolRuntime, ToolRuntimeError, ToolSpec,
+    builtin_tool_specs, ToolFailure, ToolFailureKind, ToolInvocation,
+    ToolOutcome, ToolRuntime, ToolRuntimeError, ToolSpec, MAX_FS_GLOB_RESULTS, MAX_OUTPUT_BYTES,
 };
 use crate::tools::approval::{is_read_only, ApprovalGate};
 
@@ -547,6 +547,42 @@ async fn edit_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
     })
 }
 
+// ── external-tool detection ─────────────────────────────────────────────────
+
+/// Cap on grep matches assembled from a streamed `rg --json` run. Hitting it
+/// stops the read and kills rg (rather than draining the whole match set),
+/// mirroring how the glob tools cap a walk at [`MAX_FS_GLOB_RESULTS`].
+const MAX_GREP_MATCHES: usize = 5_000;
+
+/// Probe PATH for an external search tool, trying each candidate name in order
+/// and returning the first that answers `--version`. The probe spawns a child
+/// once; the result is cached for the process lifetime, so every later call is
+/// a lock-free read. `None` means the built-in implementation is used instead
+/// — this library never downloads a binary.
+fn probe_tool(names: &[&str]) -> Option<String> {
+    for name in names {
+        let ok = std::process::Command::new(name)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some((*name).to_string());
+        }
+    }
+    None
+}
+
+/// Path/command name for ripgrep, or `None` when it is not installed. Used by
+/// the grep tool; glob uses the `ignore` crate directly and needs no binary.
+fn ripgrep_bin() -> Option<&'static str> {
+    static RG: OnceLock<Option<String>> = OnceLock::new();
+    RG.get_or_init(|| probe_tool(&["rg"])).as_deref()
+}
+
 // ── glob ──────────────────────────────────────────────────────────────────────
 
 async fn glob_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolOutcome, ToolRuntimeError> {
@@ -555,7 +591,13 @@ async fn glob_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
         Some(p) => rt.resolve(p),
         None    => rt.cwd.clone(),
     };
-    let (matches, truncated) = fs_glob_bounded(&pattern, &base);
+
+    // Glob is served entirely by the `ignore` crate — the same walker +
+    // gitignore engine ripgrep/fd are built on. Using it directly (rather than
+    // shelling out to fd) gives one deterministic, gitignore-aware behaviour
+    // with no subprocess, no PATH dependency, and no fd-vs-fallback divergence.
+    let (matches, truncated) = glob_with_ignore(&pattern, &base);
+
     Ok(ToolOutcome {
         output: Ok(json!({
             "pattern": pattern,
@@ -565,6 +607,56 @@ async fn glob_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
         })),
         attachments: vec![],
     })
+}
+
+/// Glob implementation, built on the `ignore` crate — the same walker +
+/// gitignore engine that ripgrep and fd use internally. A recursive,
+/// .gitignore/.ignore-aware walk in which a slash-less pattern like `*.rs`
+/// matches by file name at any depth, `**/*.rs` includes top-level files, and a
+/// `/`-bearing pattern (`src/*.rs`) is anchored to the search root (matching
+/// `rg -g` / git semantics). Returns files only, relative to `base`, sorted,
+/// capped at [`MAX_FS_GLOB_RESULTS`]. Honours gitignore in and out of a repo;
+/// hidden paths are searched only for dot patterns.
+fn glob_with_ignore(pattern: &str, base: &Path) -> (Vec<String>, bool) {
+    use ignore::overrides::OverrideBuilder;
+    use ignore::WalkBuilder;
+
+    // The pattern becomes a whitelist override. Override globs use the same
+    // gitignore matching semantics fd applies, which is what keeps the two
+    // backends in lockstep.
+    let mut ob = OverrideBuilder::new(base);
+    if ob.add(pattern).is_err() {
+        return (Vec::new(), false);
+    }
+    let overrides = match ob.build() {
+        Ok(o) => o,
+        Err(_) => return (Vec::new(), false),
+    };
+
+    let mut wb = WalkBuilder::new(base);
+    wb.overrides(overrides)
+        // fd --no-require-git: honour .gitignore/.ignore in and out of a repo.
+        .require_git(false)
+        // hidden(true) skips hidden entries; only search them for dot patterns.
+        .hidden(!pattern.starts_with('.'));
+
+    let mut matches: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for result in wb.build() {
+        let Ok(entry) = result else { continue };
+        // Files only (the tool lists files; fd uses --type f).
+        if entry.file_type().is_none_or(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(base) else { continue };
+        if matches.len() >= MAX_FS_GLOB_RESULTS {
+            truncated = true;
+            break;
+        }
+        matches.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+    matches.sort();
+    (matches, truncated)
 }
 
 // ── grep ──────────────────────────────────────────────────────────────────────
@@ -577,6 +669,109 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
         None    => rt.cwd.clone(),
     };
 
+    // Prefer ripgrep: gitignore-aware, faster, and streamed via `--json` so we
+    // can stop (and kill the child) the moment we have enough matches. Falls
+    // back to system grep when rg is absent or fails to spawn.
+    if let Some(rg) = ripgrep_bin() {
+        if let Some(outcome) = grep_with_rg(rg, &pattern, ci, &search, &rt.cwd, &inv.id).await? {
+            return Ok(outcome);
+        }
+    }
+    grep_with_system(&pattern, ci, &search, &rt.cwd, &inv.id).await
+}
+
+/// Stream `rg --json` and rebuild the same `path:line:text` lines the
+/// system-grep fallback emits. Returns `Ok(None)` when rg could not be spawned
+/// (caller falls back); `Ok(Some(outcome))` otherwise.
+async fn grep_with_rg(
+    rg: &str,
+    pattern: &str,
+    ci: bool,
+    search: &Path,
+    cwd: &Path,
+    id: &str,
+) -> Result<Option<ToolOutcome>, ToolRuntimeError> {
+    let mut cmd = Command::new(rg);
+    cmd.arg("--json");
+    if ci {
+        cmd.arg("-i");
+    }
+    cmd.arg("-e").arg(pattern).arg("--").arg(search);
+    cmd.current_dir(cwd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Ok(None), // rg vanished between probe and spawn → fall back
+    };
+    let raw_stdout = child.stdout.take().expect("stdout piped");
+
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut truncated = false;
+    let mut lines = tokio::io::BufReader::new(raw_stdout).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await.ok().flatten() {
+            let Ok(ev) = serde_json::from_str::<Value>(&line) else { continue };
+            if ev.get("type").and_then(Value::as_str) != Some("match") {
+                continue;
+            }
+            let data = &ev["data"];
+            // Non-UTF8 matches arrive as {"bytes": …} instead of {"text": …}; skip them.
+            let (Some(path), Some(line_no), Some(text)) = (
+                data["path"]["text"].as_str(),
+                data["line_number"].as_u64(),
+                data["lines"]["text"].as_str(),
+            ) else {
+                continue;
+            };
+            out.push_str(path);
+            out.push(':');
+            out.push_str(&line_no.to_string());
+            out.push(':');
+            out.push_str(text.trim_end_matches('\n'));
+            out.push('\n');
+            count += 1;
+            if count >= MAX_GREP_MATCHES || out.len() > MAX_OUTPUT_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+    };
+    // Same 30s ceiling as the system-grep path.
+    let timed_out = tokio::time::timeout(Duration::from_secs(30), read).await.is_err();
+    // Stop rg regardless of why we finished (limit hit / EOF / timeout).
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(CHILD_WAIT_AFTER_KILL, child.wait()).await;
+
+    if timed_out {
+        return Ok(Some(ToolOutcome {
+            output: Err(ToolFailure::new(ToolFailureKind::Timeout, "grep timed out after 30s")),
+            attachments: vec![],
+        }));
+    }
+    Ok(Some(ToolOutcome {
+        output: Ok(json!({
+            "pattern": pattern,
+            "matches": bound_output(out, id, "matches"),
+            "truncated": truncated,
+        })),
+        attachments: vec![],
+    }))
+}
+
+/// Fallback grep: shell out to system `grep -rnE` with a fixed set of pruned
+/// directories. Used when ripgrep is not installed.
+async fn grep_with_system(
+    pattern: &str,
+    ci: bool,
+    search: &Path,
+    cwd: &Path,
+    id: &str,
+) -> Result<ToolOutcome, ToolRuntimeError> {
     let mut cmd = Command::new("grep");
     cmd.args(["-rn", "-E"]);
     if ci { cmd.arg("-i"); }
@@ -591,8 +786,8 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
         "--exclude-dir=vendor",
         "--exclude-dir=.next",
     ]);
-    cmd.arg("-e").arg(&pattern).arg("--").arg(&search);
-    cmd.current_dir(&rt.cwd);
+    cmd.arg("-e").arg(pattern).arg("--").arg(search);
+    cmd.current_dir(cwd);
 
     match tokio::time::timeout(Duration::from_secs(30), cmd.output()).await {
         Err(_) => Ok(ToolOutcome {
@@ -614,7 +809,8 @@ async fn grep_invoke(inv: ToolInvocation, rt: &LocalToolRuntime) -> Result<ToolO
             Ok(ToolOutcome {
                 output: Ok(json!({
                     "pattern": pattern,
-                    "matches": bound_output(stdout, &inv.id, "matches"),
+                    "matches": bound_output(stdout, id, "matches"),
+                    "truncated": false,
                 })),
                 attachments: vec![],
             })
@@ -866,5 +1062,180 @@ mod tests {
         assert_eq!(out["success"], true);
         assert_eq!(out["exit_code"], 0);
         assert_eq!(out["shell"], "/bin/bash");
+    }
+
+    // ── grep / glob: rg/fd with fallback ────────────────────────────────────
+
+    /// A runtime rooted at `dir` (grep/glob resolve relative paths and default
+    /// their search root to it).
+    fn runtime_in(dir: &Path) -> LocalToolRuntime {
+        LocalToolRuntime::new(LocalToolConfig {
+            cwd: Some(dir.to_path_buf()),
+            approval: Arc::new(YoloApproval),
+            emit: Arc::new(|_| {}),
+        })
+    }
+
+    /// Fresh, empty temp dir unique to this test name + process.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("harness_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn grep_returns_path_line_text_and_truncated_flag() {
+        let dir = scratch("grep_shape");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "let needle = 1;\nother\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "no match here\n").unwrap();
+
+        let out = runtime_in(&dir)
+            .invoke(ToolInvocation {
+                id: "tc_grep_shape".into(),
+                name: "grep".into(),
+                input: json!({ "pattern": "needle" }),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Shape is identical whether ripgrep or system grep served the request.
+        assert!(out.get("truncated").is_some(), "missing truncated flag: {out}");
+        let matches = out["matches"].as_str().unwrap();
+        // One `path:line:text` line pointing at src/a.rs line 1.
+        assert!(matches.contains("a.rs:1:"), "unexpected matches: {matches:?}");
+        assert!(matches.contains("needle"), "unexpected matches: {matches:?}");
+        assert!(!matches.contains("no match here"), "unexpected matches: {matches:?}");
+    }
+
+    #[tokio::test]
+    async fn grep_with_rg_honours_ignore_file() {
+        // `.ignore` is honoured by ripgrep unconditionally; system grep is not,
+        // so this asserts the rg path specifically.
+        let Some(rg) = ripgrep_bin() else { return };
+        let dir = scratch("grep_ignore");
+        std::fs::create_dir_all(dir.join("skip")).unwrap();
+        std::fs::write(dir.join("keep.txt"), "needle\n").unwrap();
+        std::fs::write(dir.join("skip/hit.txt"), "needle\n").unwrap();
+        std::fs::write(dir.join(".ignore"), "skip/\n").unwrap();
+
+        let outcome = grep_with_rg(rg, "needle", false, &dir, &dir, "tc_grep_ignore")
+            .await
+            .unwrap()
+            .expect("rg should have produced an outcome");
+        let out = outcome.output.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let matches = out["matches"].as_str().unwrap();
+        assert!(matches.contains("keep.txt"), "{matches:?}");
+        assert!(!matches.contains("hit.txt"), "ignored dir leaked: {matches:?}");
+    }
+
+    #[tokio::test]
+    async fn glob_returns_relative_paths_and_truncated_flag() {
+        let dir = scratch("glob_shape");
+        std::fs::create_dir_all(dir.join("src/sub")).unwrap();
+        std::fs::write(dir.join("top.rs"), "").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("src/sub/deep.rs"), "").unwrap();
+
+        let out = runtime_in(&dir)
+            .invoke(ToolInvocation {
+                id: "tc_glob_shape".into(),
+                name: "glob".into(),
+                input: json!({ "pattern": "**/*.rs" }),
+            })
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(out.get("truncated").is_some(), "missing truncated flag: {out}");
+        let matches: Vec<String> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        // `**/*.rs` is recursive AND includes top-level files under both backends.
+        assert!(matches.iter().any(|m| m == "top.rs"), "{matches:?}");
+        assert!(matches.iter().any(|m| m == "src/lib.rs"), "{matches:?}");
+        assert!(matches.iter().any(|m| m == "src/sub/deep.rs"), "{matches:?}");
+        // Paths are relative to the search root, never absolute.
+        assert!(matches.iter().all(|m| !m.starts_with('/')), "{matches:?}");
+    }
+
+    #[test]
+    fn glob_matches_bare_pattern_at_any_depth() {
+        // A slash-less pattern recurses (matches by file name at any depth) —
+        // unlike the old hand-written walk, which only matched the top level.
+        let dir = scratch("glob_recurse");
+        std::fs::create_dir_all(dir.join("src/sub")).unwrap();
+        std::fs::write(dir.join("top.rs"), "").unwrap();
+        std::fs::write(dir.join("src/a.rs"), "").unwrap();
+        std::fs::write(dir.join("src/sub/deep.rs"), "").unwrap();
+
+        let (matches, truncated) = glob_with_ignore("*.rs", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!truncated);
+        assert_eq!(
+            matches,
+            vec!["src/a.rs", "src/sub/deep.rs", "top.rs"],
+            "bare `*.rs` should match .rs files at every depth"
+        );
+    }
+
+    #[test]
+    fn glob_slash_pattern_is_anchored_to_root() {
+        // A `/`-bearing pattern anchors to the search root (rg -g / git
+        // semantics): `src/*.rs` matches src/a.rs but not sub/src or top-level.
+        let dir = scratch("glob_anchor");
+        std::fs::create_dir_all(dir.join("src/sub")).unwrap();
+        std::fs::write(dir.join("top.rs"), "").unwrap();
+        std::fs::write(dir.join("src/a.rs"), "").unwrap();
+        std::fs::write(dir.join("src/sub/deep.rs"), "").unwrap();
+
+        let (matches, _) = glob_with_ignore("src/*.rs", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(matches, vec!["src/a.rs"], "`src/*.rs` should anchor to the root");
+    }
+
+    #[test]
+    fn glob_honours_ignore_file() {
+        let dir = scratch("glob_ignore");
+        std::fs::create_dir_all(dir.join("skip")).unwrap();
+        std::fs::write(dir.join("keep.rs"), "").unwrap();
+        std::fs::write(dir.join("skip/hidden.rs"), "").unwrap();
+        std::fs::write(dir.join(".ignore"), "skip/\n").unwrap();
+
+        let (matches, _) = glob_with_ignore("**/*.rs", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(matches.iter().any(|m| m == "keep.rs"), "{matches:?}");
+        assert!(!matches.iter().any(|m| m.contains("hidden.rs")), "ignored dir leaked: {matches:?}");
+    }
+
+    #[tokio::test]
+    async fn grep_system_fallback_produces_expected_shape() {
+        // Directly exercise the fallback so it is covered even where rg exists.
+        let dir = scratch("grep_fallback");
+        std::fs::write(dir.join("f.rs"), "let needle = 1;\n").unwrap();
+
+        let out = grep_with_system("needle", false, &dir, &dir, "tc_grep_fallback")
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(out["truncated"], false);
+        assert!(out["matches"].as_str().unwrap().contains("needle"), "{out}");
     }
 }

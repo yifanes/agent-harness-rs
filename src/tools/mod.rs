@@ -1025,10 +1025,12 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "grep".into(),
             description:
-                "Search file contents under a path using `grep -rnE` (extended regex). Returns \
-                 matching lines as `path:line:text`. Dependency and build directories \
-                 (node_modules, target, …) are skipped; the match count is capped and overlong \
-                 lines are clipped — a `truncated` flag signals when to narrow the pattern or path."
+                "Search file contents under a path with an extended-regex pattern. Returns \
+                 matching lines as `path:line:text`. Uses ripgrep when available (honouring \
+                 .gitignore and skipping hidden files), otherwise falls back to system \
+                 `grep -rnE` with dependency/build directories (node_modules, target, …) pruned. \
+                 The match count is capped — a `truncated` flag signals when to narrow the \
+                 pattern or path."
                     .into(),
             input_schema: json!({
                 "type": "object",
@@ -1053,10 +1055,13 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "glob".into(),
             description:
-                "Find files matching a shell-style name pattern (e.g. `*.rs`). Returns relative \
-                 paths under the search root, one per line. Dependency and build directories \
-                 (node_modules, target, dist, …) are skipped, and the result count is capped — \
-                 a `truncated` flag signals when to narrow the pattern or search a subdirectory."
+                "Find files matching a shell-style glob (e.g. `*.rs`, `**/Cargo.toml`), searched \
+                 recursively and honouring .gitignore/.ignore. A slash-less pattern like `*.rs` \
+                 matches by file name at ANY depth; anchor with a `/`-bearing pattern (e.g. \
+                 `src/*.rs`) to restrict to one directory level. Hidden files are searched only \
+                 when the pattern itself starts with `.`. Returns relative file paths under the \
+                 search root, one per line. The result count is capped — a `truncated` flag \
+                 signals when to narrow the pattern or search a subdirectory."
                     .into(),
             input_schema: json!({
                 "type": "object",
