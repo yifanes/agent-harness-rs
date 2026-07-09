@@ -4,6 +4,34 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.9] - 2026-07-09
+
+### Added
+
+- Added `ToolInvocation::raw_emitted_args`, an optional verbatim copy of
+  streamed model-emitted tool-call argument JSON when it matches the parsed
+  `input`.
+- Added raw tool-argument replay for OpenAI-compatible history projection, so
+  preserved argument bytes are used instead of re-serializing the parsed JSON
+  when safe.
+- Added `CompactionPolicy::new` for injecting custom `CompactionStrategy`
+  implementations.
+- Added `CompactionPolicy::summarizing` and `DefaultCompactionStrategy` as
+  explicit public entry points for the existing default compaction behavior.
+
+### Documentation
+
+- Documented pluggable compaction policy inputs, output invariants, and README
+  setup examples.
+- Documented when `ToolInvocation::raw_emitted_args` is populated and when it
+  is cleared or omitted.
+
+### Tests
+
+- Added coverage for preserving streamed raw tool arguments, using them in
+  OpenAI-compatible projection, and ignoring stale raw arguments.
+- Added coverage for the public compaction policy constructors.
+
 ## [0.2.7] - 2026-06-26
 
 ### Added

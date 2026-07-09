@@ -93,6 +93,19 @@ Returned histories must keep provider invariants intact: any retained assistant
 tool calls still need their matching tool results, and strategies should return
 the original messages unchanged when they cannot safely compact.
 
+## Raw tool-call arguments
+
+`ToolInvocation` includes `raw_emitted_args: Option<String>` for consumers that
+need to replay or inspect the exact streamed tool-call argument JSON emitted by
+the model. It is populated when a provider streams raw argument deltas and those
+bytes still parse to the same value as `input`.
+
+Synthetic calls, restored histories that predate the field, provider paths that
+only expose parsed input, and invocations repaired by schema/truncation handling
+use `None`. OpenAI-compatible history projection uses the raw arguments when
+they are present and still match `input`; otherwise it falls back to serializing
+the structured `input`.
+
 ## Web tools
 
 `agent-harness-rs` intentionally separates harness-executed tools from
