@@ -68,6 +68,31 @@ while let Some(event) = rx.recv().await {
 }
 ```
 
+## Compaction policy
+
+Compaction is opt-in and pluggable. The default policy is
+`SummarizeCompactionStrategy`: it prunes old oversized tool outputs first, then
+summarizes the history when it still exceeds the configured context-window
+threshold.
+
+```rust
+use harness::{AgentLoopHarness, CompactionPolicy};
+use std::sync::Arc;
+
+let context_window_tokens = 128_000;
+let harness = AgentLoopHarness::new(model.clone(), tools).with_compaction(
+    CompactionPolicy::summarizing(Arc::new(model), context_window_tokens),
+);
+```
+
+Consumers that need different retention rules can implement
+`CompactionStrategy` and pass it through `CompactionPolicy::new`. The strategy
+receives the full `Vec<ChatMessage>` plus `CompactionContext` containing the
+system prompt, model client, context-window size, and current tool specs.
+Returned histories must keep provider invariants intact: any retained assistant
+tool calls still need their matching tool results, and strategies should return
+the original messages unchanged when they cannot safely compact.
+
 ## Web tools
 
 `agent-harness-rs` intentionally separates harness-executed tools from

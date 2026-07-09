@@ -192,9 +192,13 @@ pub fn resolve_context_window_tokens(model: &str) -> u64 {
     crate::model_limits::resolve_context_window_tokens(model)
 }
 
-/// Context passed to `compact()`. Owns the model client + tools the
-/// summary call will use (mirrors the main agent's call so the prefix
-/// stays cache-hot).
+/// Context passed to [`CompactionStrategy::compact`].
+///
+/// The policy receives the same system prompt, model client, resolved context
+/// window, and tool specs that the agent loop would use for the next model
+/// step. A strategy can use these inputs to run a summarization model call,
+/// make a deterministic retention decision without a model, or decline to
+/// change the history by returning the original `messages`.
 pub struct CompactionContext {
     pub system_prompt: Option<String>,
     pub model_client: Arc<dyn ModelClient>,
@@ -227,19 +231,35 @@ pub enum CompactionError {
 
 #[async_trait]
 pub trait CompactionStrategy: Send + Sync {
-    /// Boolean gate. Pure (no side effects). Cheap to call every step.
+    /// Decide whether the agent loop should call [`Self::compact`] before the
+    /// next model step.
+    ///
+    /// This method should be cheap and side-effect-free because it is checked
+    /// before every step. Returning `false` leaves history unchanged.
     fn should_compact(&self, messages: &[ChatMessage], context_window_tokens: u64) -> bool;
 
-    /// Fold history. Caller hands over the full `messages` list and
-    /// expects a shorter list back (typically `[summary, ...tail]`).
-    /// Failures bubble up; agent_loop treats them as "skip this turn's
-    /// compaction" rather than failing the whole turn.
+    /// Return the message history that should replace the current history.
+    ///
+    /// Implementations must preserve provider invariants for any tool-call
+    /// history they keep: assistant tool calls must still be followed by their
+    /// matching tool results, and orphan tool results must not be introduced.
+    /// If the strategy cannot safely compact, it should return the original
+    /// `messages` with `usage: None` rather than fabricating an invalid
+    /// history. Errors are treated by the agent loop as "skip this turn's
+    /// compaction" rather than a failed user turn.
     async fn compact(
         &self,
         messages: Vec<ChatMessage>,
         ctx: &CompactionContext,
     ) -> Result<CompactionOutcome, CompactionError>;
 }
+
+/// Default compaction/retention policy.
+///
+/// Alias for [`SummarizeCompactionStrategy`] so consumers can refer to the
+/// stable "default policy" concept while the implementation name remains
+/// descriptive.
+pub type DefaultCompactionStrategy = SummarizeCompactionStrategy;
 
 /// Codex-style local compaction: send the full history to the model with a
 /// handoff-summary prompt appended, collect the reply as a checkpoint, then

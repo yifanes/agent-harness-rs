@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::compaction::{estimate_messages_tokens, CompactionContext, CompactionStrategy};
+use crate::compaction::{
+    estimate_messages_tokens, CompactionContext, CompactionStrategy, SummarizeCompactionStrategy,
+};
 use crate::event::{HarnessInternalEvent, HarnessUsage, NativeHarnessError, NativeTurnInput};
 use crate::model::{
     AssistantThinking, ChatMessage, HostedTool, ModelChunk, ModelClient, ModelClientError,
@@ -31,6 +33,39 @@ pub struct CompactionPolicy {
     /// Anthropic cache prefix stays hot; tests may swap in a fake.
     pub model_client: Arc<dyn ModelClient>,
     pub context_window_tokens: u64,
+}
+
+impl CompactionPolicy {
+    /// Build a compaction policy from a custom strategy.
+    ///
+    /// The strategy receives the full message history plus a
+    /// [`CompactionContext`] containing `model_client`, `context_window_tokens`,
+    /// and the current tool specs. Custom strategies may ignore the model
+    /// client entirely, or use it to produce their own summaries.
+    pub fn new(
+        strategy: Arc<dyn CompactionStrategy>,
+        model_client: Arc<dyn ModelClient>,
+        context_window_tokens: u64,
+    ) -> Self {
+        Self {
+            strategy,
+            model_client,
+            context_window_tokens,
+        }
+    }
+
+    /// Build the default summarizing compaction policy used by the harness.
+    ///
+    /// This preserves the existing compaction behavior: old oversized tool
+    /// outputs are pruned first, and when pruning is insufficient the history is
+    /// folded with [`SummarizeCompactionStrategy::default`].
+    pub fn summarizing(model_client: Arc<dyn ModelClient>, context_window_tokens: u64) -> Self {
+        Self::new(
+            Arc::new(SummarizeCompactionStrategy::default()),
+            model_client,
+            context_window_tokens,
+        )
+    }
 }
 
 /// Default mid-stream idle timeout: how long `consume_step_stream` waits
@@ -2125,11 +2160,11 @@ mod tests {
             invoked: invoked.clone(),
             per_call_usage: usage(50, 20, 0),
         };
-        let policy = CompactionPolicy {
-            strategy: Arc::new(strategy),
-            model_client: Arc::new(ScriptedModelClient),
-            context_window_tokens: 1, // forces should_compact's true branch
-        };
+        let policy = CompactionPolicy::new(
+            Arc::new(strategy),
+            Arc::new(ScriptedModelClient),
+            1, // forces should_compact's true branch
+        );
         let harness = AgentLoopHarness::new(model, MockToolRuntime::new()).with_compaction(policy);
         let mut rx = harness
             .run_turn(NativeTurnInput {
@@ -2201,13 +2236,13 @@ mod tests {
         // called because our strategy short-circuits, but we satisfy
         // the policy contract.
         let summary_client: Arc<dyn ModelClient> = Arc::new(ScriptedModelClient);
-        let policy = CompactionPolicy {
-            strategy: Arc::new(CountingCompactionStrategy {
+        let policy = CompactionPolicy::new(
+            Arc::new(CountingCompactionStrategy {
                 calls: calls.clone(),
             }),
-            model_client: summary_client,
-            context_window_tokens: 1, // forces should_compact to fire
-        };
+            summary_client,
+            1, // forces should_compact to fire
+        );
 
         let harness = AgentLoopHarness::new(model, MockToolRuntime::new()).with_compaction(policy);
         let mut rx = harness
@@ -2251,6 +2286,14 @@ mod tests {
             }
             other => panic!("expected User, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compaction_policy_summarizing_uses_default_strategy() {
+        let policy = CompactionPolicy::summarizing(Arc::new(ScriptedModelClient), 100_000);
+
+        assert_eq!(policy.context_window_tokens, 100_000);
+        assert!(!policy.strategy.should_compact(&[], 100_000));
     }
 
     /// Model client whose stream blocks indefinitely until cancelled.
