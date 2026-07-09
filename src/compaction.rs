@@ -135,13 +135,22 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
 }
 
 /// Reduce a reported usage tally to a single context-size figure: the
-/// tokens the provider counted as present on input for that turn. Cache
-/// reads count toward the window occupancy just like fresh input, so they
-/// are included; output is excluded because it is emitted after the input
-/// window is measured (the emitted output only occupies the window on the
-/// *next* turn, where it appears as a later message we estimate directly).
+/// tokens the provider counted as present on input for that turn. Provider
+/// cache telemetry is intentionally not added here because those buckets are
+/// subsets/billing details of the prompt, not extra context-window occupancy.
+/// Output is excluded because it is emitted after the input window is measured
+/// (the emitted output only occupies the window on the *next* turn, where it
+/// appears as a later message we estimate directly).
 fn usage_context_tokens(u: &HarnessUsage) -> u64 {
-    u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+    // Treat `input_tokens` as the provider-reported prompt/window size.
+    //
+    // OpenAI-compatible usage reports `cached_tokens` as a subset of
+    // `prompt_tokens`; adding cache_read again double-counts cached prompt
+    // tokens and can trigger compaction far too early. Anthropic's cache
+    // fields are also telemetry about how the prompt was billed/cached; the
+    // value used for context-window occupancy must remain the total prompt
+    // size, not prompt size plus cache sub-buckets.
+    u.input_tokens
 }
 
 /// Estimate the total context size of `messages`, anchoring on the last
@@ -159,14 +168,14 @@ fn usage_context_tokens(u: &HarnessUsage) -> u64 {
 /// this falls back to a full heuristic sum, matching
 /// [`estimate_messages_tokens`].
 pub fn estimate_context_tokens_anchored(messages: &[ChatMessage]) -> u64 {
-    let anchor = messages.iter().enumerate().rev().find_map(|(idx, m)| {
-        match m {
-            ChatMessage::Assistant {
-                usage: Some(u), ..
-            } => Some((idx, usage_context_tokens(u))),
+    let anchor = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, m)| match m {
+            ChatMessage::Assistant { usage: Some(u), .. } => Some((idx, usage_context_tokens(u))),
             _ => None,
-        }
-    });
+        });
 
     match anchor {
         Some((idx, measured)) => {
@@ -366,8 +375,7 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
         // Walk old turns and replace large tool outputs with a short stub.
         // If pruning alone brings the history back under the trigger threshold
         // we skip the expensive summarise round-trip entirely.
-        let threshold =
-            ((ctx.context_window_tokens as f64) * self.trigger_fraction).round() as u64;
+        let threshold = ((ctx.context_window_tokens as f64) * self.trigger_fraction).round() as u64;
         let (messages, freed_tokens) = prune_tool_outputs(messages, PRUNE_PROTECT_TURNS);
         if freed_tokens > 0 {
             tracing::debug!(
@@ -447,11 +455,8 @@ impl CompactionStrategy for SummarizeCompactionStrategy {
         // User messages are selected newest-first within the token budget then
         // reversed to chronological order. Placing the summary last means the
         // model reads the most recent context at the end of the prompt.
-        let out = build_compacted_history(
-            &user_texts,
-            &summary_text,
-            self.user_message_token_budget,
-        );
+        let out =
+            build_compacted_history(&user_texts, &summary_text, self.user_message_token_budget);
         Ok(CompactionOutcome {
             messages: out,
             usage,
@@ -759,10 +764,11 @@ mod tests {
     }
 
     #[test]
-    fn anchored_estimate_counts_cache_reads_toward_window() {
-        // Cache-read tokens still occupy the context window.
+    fn anchored_estimate_does_not_double_count_cache_reads() {
+        // OpenAI-compatible cached_tokens is a subset of prompt_tokens. Cache
+        // telemetry must not inflate context-window occupancy.
         let msgs = vec![assistant_with_usage("ok", 10_000, 25_000)];
-        assert_eq!(estimate_context_tokens_anchored(&msgs), 35_000);
+        assert_eq!(estimate_context_tokens_anchored(&msgs), 10_000);
     }
 
     #[test]
@@ -879,10 +885,8 @@ mod tests {
             other => panic!("expected User at [2], got {other:?}"),
         }
         // Summary is the last message.
-        assert!(
-            matches!(&out[3], ChatMessage::User { content, .. }
-                if content.contains("<conversation-summary>") && content.contains("we ran ls and grep"))
-        );
+        assert!(matches!(&out[3], ChatMessage::User { content, .. }
+                if content.contains("<conversation-summary>") && content.contains("we ran ls and grep")));
         // Output is shorter than input (6 messages → 4).
         assert!(out.len() < 6);
         // FixedSummaryClient doesn't report usage → outcome.usage is None.
@@ -1018,7 +1022,10 @@ mod tests {
             big_tool("t2"),
         ];
         let (out, freed) = prune_tool_outputs(messages.clone(), 2);
-        assert_eq!(freed, 0, "summary boundary must block pruning of earlier content");
+        assert_eq!(
+            freed, 0,
+            "summary boundary must block pruning of earlier content"
+        );
         assert_eq!(out, messages);
     }
 
@@ -1065,9 +1072,6 @@ mod tests {
         // Prune replaced the big output — usage is None (no model call).
         assert!(outcome.usage.is_none());
         // The stub is present at index 1.
-        assert_eq!(
-            outcome.messages[1],
-            tool_msg("t0", PRUNED_CONTENT_STUB)
-        );
+        assert_eq!(outcome.messages[1], tool_msg("t0", PRUNED_CONTENT_STUB));
     }
 }

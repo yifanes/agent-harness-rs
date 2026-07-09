@@ -4,6 +4,16 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.10] - 2026-07-09
+
+### Fixed
+
+- Prevented cached prompt-token telemetry from being double-counted in anchored
+  compaction estimates.
+- Scoped dynamic `models.dev` limits to one trusted provider, defaulting to
+  `opencode`, so provider-local model ID collisions do not overwrite context
+  windows with unrelated gateway values.
+
 ## [0.2.9] - 2026-07-09
 
 ### Added
