@@ -119,6 +119,7 @@ fn tool_invocation_from_prompt(prompt: &str) -> ToolInvocation {
             id: "tc_read_1".into(),
             name: "read".into(),
             input: serde_json::json!({"path": path.trim()}),
+            raw_emitted_args: None,
         }
     } else if let Some(rest) = trimmed.strip_prefix("write ") {
         let (path, content) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -126,12 +127,14 @@ fn tool_invocation_from_prompt(prompt: &str) -> ToolInvocation {
             id: "tc_write_1".into(),
             name: "write".into(),
             input: serde_json::json!({"path": path.trim(), "content": content}),
+            raw_emitted_args: None,
         }
     } else {
         ToolInvocation {
             id: "tc_bash_1".into(),
             name: "bash".into(),
             input: serde_json::json!({"command": trimmed}),
+            raw_emitted_args: None,
         }
     }
 }

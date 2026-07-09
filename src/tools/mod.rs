@@ -31,6 +31,15 @@ pub struct ToolInvocation {
     pub id: String,
     pub name: String,
     pub input: Value,
+    /// Verbatim JSON argument text emitted by the model for this tool call.
+    ///
+    /// Populated when the provider streams raw argument deltas, such as
+    /// OpenAI-compatible `function.arguments` chunks. `None` for synthetic
+    /// invocations, provider-final parsed inputs, restored histories that
+    /// predate this field, or repaired inputs where the literal model text no
+    /// longer matches `input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_emitted_args: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1230,6 +1239,7 @@ mod tests {
                     "old_string": "world",
                     "new_string": "rust",
                 }),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1242,6 +1252,7 @@ mod tests {
                 id: "tc_read".into(),
                 name: "read".into(),
                 input: json!({"path": "a.txt"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1258,6 +1269,7 @@ mod tests {
                 id: "tc_edit".into(),
                 name: "edit".into(),
                 input: json!({"path": "a.txt", "old_string": "foo", "new_string": "bar"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1330,6 +1342,7 @@ mod tests {
                 name: "edit".into(),
                 // Model emitted literal \n instead of a real newline.
                 input: json!({"path": "a.txt", "old_string": "line1\\nline2", "new_string": "merged"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1347,6 +1360,7 @@ mod tests {
                 id: "tc_read".into(),
                 name: "read".into(),
                 input: json!({"path": "a.txt"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1365,6 +1379,7 @@ mod tests {
                 id: "tc_grep".into(),
                 name: "grep".into(),
                 input: json!({"pattern": "alpha", "case_insensitive": true}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1385,6 +1400,7 @@ mod tests {
                 id: "tc_glob".into(),
                 name: "glob".into(),
                 input: json!({"pattern": "**/*.rs"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1402,6 +1418,7 @@ mod tests {
                 id: "tc_read".into(),
                 name: "read".into(),
                 input: json!({"path":"README.md"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();
@@ -1412,6 +1429,7 @@ mod tests {
                 id: "tc_write".into(),
                 name: "write".into(),
                 input: json!({"path":"out.txt", "content":"ok"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();
@@ -1422,6 +1440,7 @@ mod tests {
                 id: "tc_bash".into(),
                 name: "bash".into(),
                 input: json!({"command":"pwd"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();

@@ -919,6 +919,7 @@ mod tests {
                 id: "tc_nonzero".into(),
                 name: "bash".into(),
                 input: json!({"command": "printf nope >&2; exit 7"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -940,6 +941,7 @@ mod tests {
                     "soft_timeout_ms": 1000,
                     "timeout_ms": 5000
                 }),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -966,6 +968,7 @@ mod tests {
                     "soft_timeout_ms": 200,
                     "timeout_ms": 5000
                 }),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1009,6 +1012,7 @@ mod tests {
                             "soft_timeout_ms": 5000,
                             "timeout_ms": 10000
                         }),
+                        raw_emitted_args: None,
                     },
                     Some(&cancel_for_task),
                 )
@@ -1054,6 +1058,7 @@ mod tests {
                 id: "tc_bash_syntax".into(),
                 name: "bash".into(),
                 input: json!({"command": "diff <(printf a) <(printf a)"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1096,6 +1101,7 @@ mod tests {
                 id: "tc_grep_shape".into(),
                 name: "grep".into(),
                 input: json!({ "pattern": "needle" }),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()
@@ -1148,6 +1154,7 @@ mod tests {
                 id: "tc_glob_shape".into(),
                 name: "glob".into(),
                 input: json!({ "pattern": "**/*.rs" }),
+                raw_emitted_args: None,
             })
             .await
             .unwrap()

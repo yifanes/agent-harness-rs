@@ -356,6 +356,7 @@ mod tests {
             id: "wf1".into(),
             name: "web_fetch".into(),
             input: json!({"url": url}),
+            raw_emitted_args: None,
         })
         .await
         .unwrap();
@@ -375,6 +376,7 @@ mod tests {
             id: "wf2".into(),
             name: "web_fetch".into(),
             input: json!({"url": url, "max_length": 3}),
+            raw_emitted_args: None,
         })
         .await
         .unwrap();
@@ -389,6 +391,7 @@ mod tests {
             id: "wf3".into(),
             name: "web_fetch".into(),
             input: json!({"url": "file:///etc/passwd"}),
+            raw_emitted_args: None,
         })
         .await
         .unwrap();

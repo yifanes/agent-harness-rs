@@ -1617,6 +1617,7 @@ mod tests {
                 id: "tc1".into(),
                 name: "fs__echo".into(),
                 input: json!({"text": "x"}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();
@@ -1634,6 +1635,7 @@ mod tests {
                 id: "tc".into(),
                 name: "nope__whatever".into(),
                 input: json!({}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap_err();
@@ -1718,6 +1720,7 @@ mod tests {
                 id: "tc".into(),
                 name: "bash".into(),
                 input: json!({}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();
@@ -1729,6 +1732,7 @@ mod tests {
                 id: "tc".into(),
                 name: "fs__list".into(),
                 input: json!({}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap();
@@ -1740,6 +1744,7 @@ mod tests {
                 id: "tc".into(),
                 name: "ghost".into(),
                 input: json!({}),
+                raw_emitted_args: None,
             })
             .await
             .unwrap_err();
