@@ -587,6 +587,7 @@ async fn run_loop<M, R>(
                     // ToolCall events below — keeps history, wire, and the
                     // wrapper's (idempotent) dispatch-time repair in agreement.
                     if let Some(repairs) = tools.repair_invocation(inv) {
+                        inv.raw_emitted_args = None;
                         tracing::warn!(
                             target: "harness::tool_repair",
                             tool = %inv.name,
@@ -1155,10 +1156,12 @@ async fn consume_step_stream(
                     }
                 }
             };
+            let raw_emitted_args = raw_args_for_input(&state.args_buf, &parsed_input);
             invocations.push(ToolInvocation {
                 id: state.id,
                 name: state.name,
                 input: parsed_input,
+                raw_emitted_args,
             });
         }
         return Ok(StepDrain::Complete(StepOutcome {
@@ -1186,6 +1189,17 @@ struct ToolBuf {
     name: String,
     args_buf: String,
     early_input: Option<Value>,
+}
+
+fn raw_args_for_input(raw: &str, input: &Value) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) if parsed == *input => Some(trimmed.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1305,6 +1319,7 @@ mod tests {
                     id: "tc_1".into(),
                     name: "bash".into(),
                     input: serde_json::json!({"command": "pwd"}),
+                    raw_emitted_args: None,
                 },
                 usage: Some(usage(10, 5, 0)),
             },

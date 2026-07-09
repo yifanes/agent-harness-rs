@@ -407,12 +407,14 @@ pub async fn collect_model_response(
                 ))
             })?,
         };
+        let raw_emitted_args = raw_args_for_input(&state.args_buf, &parsed_input);
         return Ok(ModelResponse::ToolCall {
             preface: (!text_buf.is_empty()).then(|| text_buf.clone()),
             invocation: ToolInvocation {
                 id: state.id,
                 name: state.name,
                 input: parsed_input,
+                raw_emitted_args,
             },
             usage,
         });
@@ -433,6 +435,24 @@ struct ToolStreamState {
     name: String,
     args_buf: String,
     early_input: Option<Value>,
+}
+
+fn raw_args_for_input(raw: &str, input: &Value) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) if parsed == *input => Some(trimmed.to_string()),
+        _ => None,
+    }
+}
+
+fn tool_invocation_args_for_wire(tc: &ToolInvocation) -> String {
+    tc.raw_emitted_args
+        .as_deref()
+        .and_then(|raw| raw_args_for_input(raw, &tc.input))
+        .unwrap_or_else(|| tc.input.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -723,7 +743,7 @@ fn chat_message_to_wire(msg: &ChatMessage) -> Value {
                             "type": "function",
                             "function": {
                                 "name": tc.name,
-                                "arguments": tc.input.to_string(),
+                                "arguments": tool_invocation_args_for_wire(tc),
                             },
                         })
                     })
@@ -2391,6 +2411,87 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn collect_model_response_preserves_raw_tool_arguments() {
+        let chunks = vec![
+            Ok(ModelChunk::ToolCallStart {
+                id: "call_x".into(),
+                name: "bash".into(),
+            }),
+            Ok(ModelChunk::ToolCallInputDelta {
+                id: "call_x".into(),
+                delta: r#"{ "b": 2, "#.into(),
+            }),
+            Ok(ModelChunk::ToolCallInputDelta {
+                id: "call_x".into(),
+                delta: r#""a": 1 }"#.into(),
+            }),
+            Ok(ModelChunk::ToolCallEnd {
+                id: "call_x".into(),
+                input: None,
+            }),
+            Ok(ModelChunk::Done {
+                stop_reason: "end_turn".into(),
+                usage: None,
+            }),
+        ];
+
+        let response = collect_model_response(futures::stream::iter(chunks).boxed())
+            .await
+            .unwrap();
+        let ModelResponse::ToolCall { invocation, .. } = response else {
+            panic!("expected tool call response");
+        };
+
+        assert_eq!(invocation.input, json!({"b": 2, "a": 1}));
+        assert_eq!(
+            invocation.raw_emitted_args.as_deref(),
+            Some(r#"{ "b": 2, "a": 1 }"#)
+        );
+    }
+
+    #[test]
+    fn openai_projection_uses_raw_tool_arguments_when_matching_input() {
+        let msg = ChatMessage::Assistant {
+            text: None,
+            tool_calls: vec![ToolInvocation {
+                id: "call_1".into(),
+                name: "bash".into(),
+                input: json!({"b": 2, "a": 1}),
+                raw_emitted_args: Some(r#"{ "b": 2, "a": 1 }"#.into()),
+            }],
+            thinking: None,
+            usage: None,
+        };
+
+        let wire = chat_message_to_wire(&msg);
+        assert_eq!(
+            wire["tool_calls"][0]["function"]["arguments"],
+            r#"{ "b": 2, "a": 1 }"#
+        );
+    }
+
+    #[test]
+    fn openai_projection_ignores_stale_raw_tool_arguments() {
+        let msg = ChatMessage::Assistant {
+            text: None,
+            tool_calls: vec![ToolInvocation {
+                id: "call_1".into(),
+                name: "bash".into(),
+                input: json!({"command": "pwd"}),
+                raw_emitted_args: Some(r#"{"command": "rm -rf /"}"#.into()),
+            }],
+            thinking: None,
+            usage: None,
+        };
+
+        let wire = chat_message_to_wire(&msg);
+        assert_eq!(
+            wire["tool_calls"][0]["function"]["arguments"],
+            json!({"command": "pwd"}).to_string()
+        );
+    }
+
     #[test]
     fn map_openai_finish_reason_table() {
         assert_eq!(map_openai_finish_reason(Some("stop")), "end_turn");
@@ -2547,6 +2648,7 @@ mod tests {
                     id: "tc_big".into(),
                     name: "bash".into(),
                     input: json!({}),
+                    raw_emitted_args: None,
                 }],
                 thinking: None,
                 usage: None,
@@ -2576,6 +2678,7 @@ mod tests {
                     id: "tc_img".into(),
                     name: "screenshot".into(),
                     input: json!({}),
+                    raw_emitted_args: None,
                 }],
                 thinking: None,
                 usage: None,
@@ -2662,6 +2765,7 @@ mod tests {
                     id: "tc_1".into(),
                     name: "screenshot".into(),
                     input: json!({}),
+                    raw_emitted_args: None,
                 }],
                 thinking: None,
                 usage: None,
@@ -2731,6 +2835,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "bash".into(),
                     input: json!({"command": "pwd"}),
+                    raw_emitted_args: None,
                 }],
                 thinking: None,
                 usage: None,
@@ -2767,6 +2872,7 @@ mod tests {
                 id: "t".into(),
                 name: "n".into(),
                 input: json!({"a": 1}),
+                raw_emitted_args: None,
             }],
             thinking: Some(AssistantThinking {
                 text: "deep thought".into(),
@@ -2796,6 +2902,7 @@ mod tests {
                     id: "t".into(),
                     name: "n".into(),
                     input: json!({}),
+                    raw_emitted_args: None,
                 }],
                 thinking: None,
                 usage: None,
@@ -3285,6 +3392,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "bash".into(),
                         input: json!({"command": "pwd"}),
+                        raw_emitted_args: None,
                     }],
                     thinking: None,
                     usage: None,

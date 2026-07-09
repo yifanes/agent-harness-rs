@@ -182,6 +182,7 @@ mod tests {
             id: "tc_1".into(),
             name: name.into(),
             input,
+            raw_emitted_args: None,
         }
     }
 

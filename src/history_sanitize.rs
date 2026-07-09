@@ -175,6 +175,7 @@ mod tests {
                     id: (*id).into(),
                     name: "bash".into(),
                     input: serde_json::json!({}),
+                    raw_emitted_args: None,
                 })
                 .collect(),
             thinking: None,

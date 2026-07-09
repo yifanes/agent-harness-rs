@@ -704,6 +704,7 @@ mod tests {
                 id: "tc".into(),
                 name: "bash".into(),
                 input: serde_json::json!({"command": "echo lots of bytes here for sure"}),
+                raw_emitted_args: None,
             }],
             thinking: None,
             usage: None,
