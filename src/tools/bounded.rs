@@ -3,13 +3,13 @@
 //! Mirrors the concerns MiMoCode bundles into its `Tool.wrap()`:
 //!
 //!   1. **Repair** — schema-guided input repair is the single source of
-//!      truth here ([`repair_invocation`]). `agent_loop` calls it BEFORE
+//!      truth here (`repair_invocation`). `agent_loop` calls it BEFORE
 //!      pushing history / emitting `ToolCall` events so the recorded args
 //!      match what the inner runtime executes; the same call inside
-//!      [`invoke_cancellable`] is then idempotent (already-repaired input
+//!      `invoke_cancellable` is then idempotent (already-repaired input
 //!      yields `None`) and also covers bypass callers (`runner`, `mcp`).
 //!   2. **Validate** — lightweight schema validation; a violation returns a
-//!      teaching [`ToolFailure`] (with an `Expected shape` example) WITHOUT
+//!      teaching [`crate::tools::ToolFailure`] (with an `Expected shape` example) WITHOUT
 //!      reaching the inner runtime.
 //!   3. **Span** — one `tracing` span per invocation.
 //!   4. **Safety-net bound** — a success output whose serialized form blows

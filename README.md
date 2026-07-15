@@ -8,9 +8,9 @@ Agent loop harness for building LLM-powered coding agents. Provides a complete r
 
 ## Features
 
-- **Agent loop** — OpenAI-compatible and Anthropic streaming model clients with retry, reconnect, silent-stop detection, and compaction
+- **Agent loop** — OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic streaming model clients with retry, reconnect, silent-stop detection, and compaction
 - **Local tools** — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch` with approval gate (`feature = "local-tools"`, default)
-- **Hosted tools** — Provider-native tools that execute at the model provider; currently Anthropic native `web_search`
+- **Hosted tools** — Provider-native tools that execute at the model provider; currently Anthropic native `web_search` and OpenAI Responses hosted `web_search`
 - **Sandbox tools** — Generic `SandboxExecutor` trait for any remote sandbox
 - **E2b integration** — `E2bToolRuntime` via Connect Protocol to envd (`feature = "e2b"`)
 - **Context persistence** — JSONL-based context store with incremental append and compaction rewrite
@@ -67,6 +67,59 @@ while let Some(event) = rx.recv().await {
     println!("{event:?}");
 }
 ```
+
+## OpenAI Responses API
+
+Use `OpenAiResponsesModelClient` for OpenAI's Responses API and GPT-5 /
+reasoning-model workflows. The client appends `/responses` to `base_url`
+unless the route is already present.
+
+```rust
+use harness::{
+    AgentLoopHarness, NativeTurnInput, OpenAiResponsesConfig,
+    OpenAiResponsesModelClient,
+};
+use std::path::PathBuf;
+
+let model = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+    base_url: OpenAiResponsesConfig::DEFAULT_BASE_URL.into(),
+    api_key: std::env::var("OPENAI_API_KEY").unwrap(),
+    model: "gpt-5".into(),
+    temperature: None,
+    max_output_tokens: Some(4096),
+    reasoning_effort: Some("medium".into()),
+    reasoning_summary: Some("auto".into()),
+});
+
+let harness = AgentLoopHarness::new(model, tools);
+
+let mut rx = harness.run_turn(NativeTurnInput {
+    prompt_text: "Inspect this repository and summarize the main risks".into(),
+    system_prompt: None,
+    attachments: vec![],
+    cancel_token: None,
+    prior_messages: vec![],
+    context_path: Some(PathBuf::from("/tmp/responses-session.jsonl")),
+}).await?;
+```
+
+Responses support is intentionally stateless: requests always send
+`store:false`, and the harness replays the full local history each turn. When
+reasoning is returned, the client requests
+`include:["reasoning.encrypted_content"]` and stores the encrypted reasoning
+state in `AssistantThinking.signature` so the next turn can replay it without
+using `previous_response_id` or server-side item references.
+
+Hosted `web_search` is available on Responses via the same harness API used for
+other hosted tools:
+
+```rust
+let harness = AgentLoopHarness::new(model, tools).with_web_search();
+```
+
+`ToolChoice::None` suppresses both function tools and hosted tools for that
+turn. `ToolChoice::Required` applies to the advertised tool set, including a
+hosted-only Responses turn.
 
 ## Compaction policy
 
@@ -143,9 +196,11 @@ Currently supported:
 
 - Anthropic Messages API: `HostedTool::WebSearch` is projected as
   `{"type":"web_search_20250305","name":"web_search"}`.
+- OpenAI Responses API: `HostedTool::WebSearch` is projected as
+  `{"type":"web_search"}` and executed by the provider.
 - OpenAI-compatible Chat Completions: explicitly unsupported. OpenAI web
-  search requires a future Responses API client; this crate fails fast instead
-  of pretending search is available.
+  search requires the Responses API client; this crate fails fast instead of
+  pretending search is available.
 - Other providers: unsupported unless their model client adds a hosted-tool
   projection.
 
@@ -174,7 +229,7 @@ successful while delivering no answer and taking no action.
 
 Every behavior change should be recorded in `CHANGELOG.md` before release. This
 project uses patch-only version bumps within the current minor line, so the next
-release after `0.2.5` is `0.2.6`.
+release after `0.2.10` is `0.2.11`.
 
 ### E2b sandbox
 

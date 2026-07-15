@@ -9,6 +9,28 @@ This document describes the current harness boundary: what the model sees, what 
 - Tool results are appended after execution. A failed tool call is still a valid tool result when the failure is model-correctable.
 - Infrastructure failures stop the turn; model-correctable tool failures do not.
 
+## Model Clients
+
+The crate exposes three streaming model-client families:
+
+- `OpenAiCompatibleModelClient` for Chat Completions-compatible APIs.
+- `OpenAiResponsesModelClient` for OpenAI Responses API requests.
+- `AnthropicModelClient` for Anthropic Messages API requests.
+
+`OpenAiResponsesModelClient` uses stateless Responses requests:
+
+- request route: `POST {base_url}/responses`
+- request body includes `store:false`
+- request body includes `include:["reasoning.encrypted_content"]`
+- local history is replayed in full by the harness
+- encrypted reasoning is packed into `AssistantThinking.signature` and replayed
+  as a Responses `reasoning` input item on the next turn
+
+The Responses client projects function tools as flat
+`{"type":"function","name":...}` tool definitions. Hosted `web_search` is
+projected as `{"type":"web_search"}` and is executed by the provider, not by
+the harness runtime.
+
 ## Tool Boundary
 
 All built-in tools share one boundary contract:
@@ -103,4 +125,3 @@ The following still stop the turn because they indicate harness/runtime infrastr
 - runtime transport failures not mapped to a tool settlement
 - provider stream failures after retry budget is exhausted
 - cancellation interrupts
-

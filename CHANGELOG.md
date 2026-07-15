@@ -4,6 +4,40 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.11] - 2026-07-15
+
+### Added
+
+- Added `OpenAiResponsesModelClient` and `OpenAiResponsesConfig` for the
+  OpenAI Responses API (`POST /v1/responses`), exported from the crate root.
+- Added Responses request projection for typed `input[]` history, flat
+  function tools, hosted `web_search`, image inputs, structured tool outputs,
+  `max_output_tokens`, reasoning effort, and reasoning summary configuration.
+- Added stateless Responses reasoning replay with `store:false`,
+  `include:["reasoning.encrypted_content"]`, and encrypted reasoning state
+  round-tripped through `AssistantThinking.signature`.
+- Added a live `examples/responses_smoke.rs` harness for end-to-end Responses
+  API smoke testing with text, tools, and reasoning replay.
+
+### Fixed
+
+- Ensured `ToolChoice::None` suppresses both client-side function tools and
+  provider-hosted tools for Responses turns.
+- Ensured hosted-only `ToolChoice::Required` sends
+  `"tool_choice":"required"` instead of silently degrading to provider default
+  auto.
+- Avoided emitting empty reasoning-summary separators from structural
+  `reasoning_summary_part.added` events; separators are now attached only to
+  real summary text deltas.
+- Accepted both `response.reasoning_summary_text.delta` and
+  `response.reasoning_summary.delta` SSE event names for Responses-compatible
+  gateways.
+
+### Documentation
+
+- Documented how to construct and use `OpenAiResponsesModelClient`, including
+  the stateless reasoning replay contract and hosted web-search behavior.
+
 ## [0.2.10] - 2026-07-09
 
 ### Fixed

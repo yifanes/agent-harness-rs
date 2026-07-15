@@ -2013,6 +2013,790 @@ fn classify_anthropic_http_error(status: reqwest::StatusCode, body: &str) -> Mod
     ModelClientError::Other(format!("HTTP {status}: {snippet}"))
 }
 
+// ─── OpenAI Responses API ────────────────────────────────────────────────
+//
+// The Responses API (`POST /v1/responses`) is OpenAI's current-generation
+// surface for gpt-5 / o-series reasoning models. It differs from
+// chat/completions in three load-bearing places:
+//
+//   1. Request shape   `input[]` (a heterogeneous list of typed items)
+//                      replaces `messages[]`; `system` moves to the
+//                      top-level `instructions` field; tool calls ride as
+//                      `function_call` / `function_call_output` items
+//                      (not a `tool` role); tools are FLAT
+//                      (`{type:"function", name, ...}`, no nested
+//                      `function{}`); `max_output_tokens` replaces
+//                      `max_tokens`.
+//   2. Reasoning       Reasoning surfaces as `reasoning` items. In the
+//                      stateless mode we use (`store:false`) the model's
+//                      reasoning must be round-tripped verbatim by echoing
+//                      the item `id` + `encrypted_content` back on the next
+//                      turn (requested via `include`). We fold both into
+//                      the existing `AssistantThinking.signature` field so
+//                      `ChatMessage` stays unchanged.
+//   3. SSE shape       Events are discriminated by a JSON `type` field
+//                      (`response.output_text.delta`, `response.completed`,
+//                      …) inside `data:`, not by chat's `choices[].delta`.
+//
+// As with the Anthropic section, all the work here is wire-shape
+// translation into the provider-agnostic `ModelChunk` enum; the harness
+// loop stays provider-agnostic.
+
+/// Deployment-side credentials + endpoint + knobs for the OpenAI Responses
+/// API.
+///
+/// The client always operates **statelessly** (`store:false`): this harness
+/// owns conversation history itself (persisted to `messages.jsonl`) and
+/// replays it in full every turn, so it never references OpenAI's
+/// server-side response storage. Consequently reasoning is round-tripped by
+/// echoing each item's `encrypted_content` (requested via `include`), not by
+/// `previous_response_id` / `item_reference`. A stateful (`store:true`) mode
+/// would require that item-reference machinery, which is intentionally not
+/// implemented — so no `store` knob is exposed.
+#[derive(Debug, Clone)]
+pub struct OpenAiResponsesConfig {
+    /// Full API prefix including any version segment — e.g.
+    /// `https://api.openai.com/v1`. The `/responses` route is appended.
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub temperature: Option<f64>,
+    /// Responses' replacement for `max_tokens`. `None` ⇒ provider default.
+    pub max_output_tokens: Option<i32>,
+    /// `"low"` / `"medium"` / `"high"` → `reasoning.effort`. `None` omits it.
+    pub reasoning_effort: Option<String>,
+    /// `"auto"` → `reasoning.summary`, which makes the model stream a
+    /// human-readable summary of its reasoning (surfaced as thinking
+    /// deltas). `None` omits it — the model still reasons, just silently.
+    pub reasoning_summary: Option<String>,
+}
+
+impl OpenAiResponsesConfig {
+    /// Default API prefix if the caller doesn't override `base_url`.
+    pub const DEFAULT_BASE_URL: &'static str = "https://api.openai.com/v1";
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiResponsesModelClient {
+    http: reqwest::Client,
+    config: OpenAiResponsesConfig,
+}
+
+impl OpenAiResponsesModelClient {
+    pub fn new(config: OpenAiResponsesConfig) -> Self {
+        // Same construction as the other clients: fail fast on a slow TCP
+        // handshake, but never cap per-read time — streaming reasoning
+        // responses legitimately pause between SSE frames.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { http, config }
+    }
+
+    fn endpoint(&self) -> String {
+        // `base_url` carries the version segment; we only append the route.
+        let base = self.config.base_url.trim_end_matches('/');
+        if base.ends_with("/responses") {
+            base.to_string()
+        } else {
+            format!("{base}/responses")
+        }
+    }
+
+    fn request_body(&self, input: &ModelTurnInput) -> Value {
+        let mut body = json!({
+            "model": self.config.model,
+            "input": chat_messages_to_responses_input(&input.messages),
+            "stream": true,
+            // Always stateless — see `OpenAiResponsesConfig`. The harness
+            // replays full history itself, so it never leans on server-side
+            // response storage.
+            "store": false,
+        });
+        // System prompt rides on the top-level `instructions` field — the
+        // Responses-recommended home for it (kept out of the `input[]` list).
+        if let Some(sys) = input.system_prompt.as_deref().filter(|s| !s.is_empty()) {
+            body["instructions"] = json!(sys);
+        }
+
+        // `ToolChoice::None` means "no tools this turn" — that must also
+        // suppress hosted (provider-run) tools, otherwise the model could
+        // still fire e.g. server-side web_search, defeating the caller's
+        // intent (and incurring unexpected egress / cost). Mirrors the
+        // Anthropic path, which drops all tools for `None`.
+        let advertise_tools = !matches!(input.tool_choice, ToolChoice::None);
+        let mut tools: Vec<Value> = Vec::new();
+        if advertise_tools {
+            tools.extend(input.tools.iter().map(tool_spec_to_responses_tool));
+            tools.extend(input.hosted_tools.iter().map(hosted_tool_to_responses_tool));
+        }
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+            // Emit `tool_choice` whenever it's meaningful for the advertised
+            // set — NOT only when client function tools exist:
+            //   * Auto / Required apply to the whole set (function + hosted),
+            //     so send them as long as any tool is advertised. Gating on
+            //     function tools would silently downgrade a hosted-only
+            //     `Required` to the default auto.
+            //   * Tool(name) force-selects a *function* tool, so only send it
+            //     when a function tool exists — encoding a hosted tool as
+            //     `{type:"function", name}` would be rejected as a 400.
+            let send_choice = match input.tool_choice {
+                ToolChoice::Auto | ToolChoice::Required => true,
+                ToolChoice::Tool(_) => !input.tools.is_empty(),
+                ToolChoice::None => false, // unreachable: advertise_tools is false
+            };
+            if send_choice {
+                body["tool_choice"] = responses_tool_choice_value(&input.tool_choice);
+            }
+            if let Some(parallel) = input.parallel_tool_calls {
+                body["parallel_tool_calls"] = json!(parallel);
+            }
+        }
+
+        if let Some(temperature) = self.config.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(max_output) = self.config.max_output_tokens {
+            body["max_output_tokens"] = json!(max_output);
+        }
+
+        let effort = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        let summary = self
+            .config
+            .reasoning_summary
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        if effort.is_some() || summary.is_some() {
+            let mut reasoning = json!({});
+            if let Some(e) = effort {
+                reasoning["effort"] = json!(e);
+            }
+            if let Some(s) = summary {
+                reasoning["summary"] = json!(s);
+            }
+            body["reasoning"] = reasoning;
+        }
+
+        // Stateless mode always asks OpenAI to include the encrypted
+        // reasoning payload so we can echo it back on the next turn (see
+        // `chat_messages_to_responses_input`).
+        body["include"] = json!(["reasoning.encrypted_content"]);
+
+        body
+    }
+}
+
+/// Render one `ToolSpec` into the Responses FLAT tool shape. Note the
+/// difference from chat/completions (`tool_spec_to_openai_function`), which
+/// nests everything under a `function` key.
+fn tool_spec_to_responses_tool(spec: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "name": spec.name,
+        "description": spec.description,
+        "parameters": spec.input_schema,
+    })
+}
+
+/// Project a `HostedTool` to a Responses hosted-tool definition. Unlike the
+/// chat/completions client — which rejects hosted tools outright — Responses
+/// runs them server-side and streams the result back inline.
+fn hosted_tool_to_responses_tool(tool: &HostedTool) -> Value {
+    match tool {
+        HostedTool::WebSearch { .. } => json!({ "type": "web_search" }),
+    }
+}
+
+fn responses_tool_choice_value(c: &ToolChoice) -> Value {
+    match c {
+        ToolChoice::Auto => json!("auto"),
+        // Unreachable in practice (caller drops function tools for None),
+        // but encode defensively.
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool(name) => json!({ "type": "function", "name": name }),
+    }
+}
+
+/// Render an `ImageSource` to the string the Responses `input_image` part
+/// expects. Inline base64 becomes a `data:` URI; a URL passes through.
+fn image_to_responses_data_url(src: &ImageSource) -> String {
+    match &src.data {
+        ImageData::Base64(b64) => format!("data:{};base64,{}", src.media_type, b64),
+        ImageData::Url(u) => u.clone(),
+    }
+}
+
+/// Pack a Responses reasoning item's `id` + `encrypted_content` into the
+/// single `AssistantThinking.signature` slot so reasoning round-trips
+/// without changing `ChatMessage`. The item id never contains a newline, so
+/// a `\n` separator is unambiguous. `decode_reasoning_signature` reverses it;
+/// a signature without a `\n` (e.g. an Anthropic thinking signature) decodes
+/// to `None` and is simply not re-sent as a reasoning item.
+fn encode_reasoning_signature(item_id: &str, encrypted_content: &str) -> String {
+    format!("{item_id}\n{encrypted_content}")
+}
+
+fn decode_reasoning_signature(sig: &str) -> Option<(String, String)> {
+    let (id, enc) = sig.split_once('\n')?;
+    if id.is_empty() || enc.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), enc.to_string()))
+}
+
+/// Render `ChatMessage[]` into the Responses `input[]` list. Rules:
+///
+///   1. `User` → `{role:"user", content:[input_text, input_image...]}`.
+///   2. `Assistant` expands into up to three item kinds, in order:
+///      reasoning (from `thinking`, if its signature round-trips) →
+///      `{role:"assistant", content:[output_text]}` → one `function_call`
+///      per tool call.
+///   3. `Tool` → `function_call_output` keyed by `call_id`. Image
+///      attachments ride as an `input_image` content array (Responses
+///      supports structured tool output — no lossy placeholder like the
+///      chat/completions `tool` role).
+fn chat_messages_to_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match msg {
+            ChatMessage::User {
+                content,
+                attachments,
+            } => {
+                let mut parts: Vec<Value> = Vec::with_capacity(attachments.len() + 1);
+                if !content.is_empty() {
+                    parts.push(json!({"type": "input_text", "text": content}));
+                }
+                for att in attachments {
+                    let UserAttachment::Image(src) = att;
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": image_to_responses_data_url(src),
+                    }));
+                }
+                // Responses rejects empty content arrays.
+                if parts.is_empty() {
+                    parts.push(json!({"type": "input_text", "text": ""}));
+                }
+                out.push(json!({"role": "user", "content": parts}));
+            }
+            ChatMessage::Assistant {
+                text,
+                tool_calls,
+                thinking,
+                usage: _,
+            } => {
+                // Reasoning first — only re-sent when the signature carries a
+                // decodable (item_id, encrypted_content) pair. A plain-text
+                // or Anthropic-style signature simply isn't projected.
+                if let Some(t) = thinking {
+                    if let Some((item_id, enc)) =
+                        t.signature.as_deref().and_then(decode_reasoning_signature)
+                    {
+                        let summary = if t.text.is_empty() {
+                            json!([])
+                        } else {
+                            json!([{"type": "summary_text", "text": t.text}])
+                        };
+                        out.push(json!({
+                            "type": "reasoning",
+                            "id": item_id,
+                            "summary": summary,
+                            "encrypted_content": enc,
+                        }));
+                    }
+                }
+                if let Some(t) = text.as_deref().filter(|s| !s.is_empty()) {
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": t}],
+                    }));
+                }
+                for tc in tool_calls {
+                    out.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tool_invocation_args_for_wire(tc),
+                    }));
+                }
+            }
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+                is_error: _,
+                attachments,
+            } => {
+                if attachments.is_empty() {
+                    let replay = compact_tool_result_for_replay(content).into_owned();
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_call_id,
+                        "output": replay,
+                    }));
+                } else {
+                    let mut parts: Vec<Value> = Vec::new();
+                    if !content.is_empty() {
+                        let replay = compact_tool_result_for_replay(content).into_owned();
+                        parts.push(json!({"type": "input_text", "text": replay}));
+                    }
+                    for att in attachments {
+                        let UserAttachment::Image(src) = att;
+                        parts.push(json!({
+                            "type": "input_image",
+                            "image_url": image_to_responses_data_url(src),
+                        }));
+                    }
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_call_id,
+                        "output": parts,
+                    }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pull token counts out of a Responses `usage` block. Maps:
+///   * `input_tokens`                          → `input_tokens`
+///   * `output_tokens`                         → `output_tokens`
+///   * `input_tokens_details.cached_tokens`    → `cache_read_input_tokens`
+///
+/// Returns `None` when every counter is zero / absent (no-op response).
+fn parse_responses_usage(usage: Option<&Value>) -> Option<HarnessUsage> {
+    let u = usage?;
+    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_read = u
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if input == 0 && output == 0 && cache_read == 0 {
+        return None;
+    }
+    Some(HarnessUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: 0,
+        compaction_input_tokens: 0,
+        compaction_output_tokens: 0,
+    })
+}
+
+/// Map a Responses `incomplete_details.reason` to the harness stop_reason
+/// vocabulary. A clean finish (no reason) is `end_turn` regardless of
+/// whether a tool was called — the harness dispatches tools whenever a
+/// tool call landed, independent of stop_reason.
+fn map_responses_stop_reason(reason: Option<&str>) -> String {
+    match reason {
+        Some("max_output_tokens") => "max_tokens".into(),
+        Some("content_filter") => "refusal".into(),
+        _ => "end_turn".into(),
+    }
+}
+
+/// Bucket a Responses stream-level failure (`response.failed` /
+/// top-level `error` event) into a `ModelClientError`. Mirrors the HTTP
+/// classifier's retryability split.
+fn classify_responses_error(code: &str, message: &str) -> ModelClientError {
+    let full = if code.is_empty() {
+        message.to_string()
+    } else {
+        format!("{code}: {message}")
+    };
+    if code == "context_length_exceeded" || looks_like_context_overflow(message) {
+        return ModelClientError::ContextOverflow(full);
+    }
+    if code == "rate_limit_exceeded" {
+        return ModelClientError::RateLimit(full);
+    }
+    ModelClientError::BadRequest(full)
+}
+
+#[async_trait]
+impl ModelClient for OpenAiResponsesModelClient {
+    async fn stream(
+        &self,
+        input: ModelTurnInput,
+    ) -> Result<BoxStream<'static, Result<ModelChunk, ModelClientError>>, ModelClientError> {
+        let body = self.request_body(&input);
+        let resp = match self
+            .http
+            .post(self.endpoint())
+            .bearer_auth(&self.config.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(classify_reqwest_error(&e, e.to_string())),
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            // Responses shares OpenAI's HTTP error shape, so the same
+            // status/body classifier applies.
+            return Err(classify_openai_http_error(status, &body_text));
+        }
+
+        let event_stream = resp.bytes_stream().eventsource();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ModelChunk, ModelClientError>>(8);
+        tokio::spawn(async move {
+            let mut state = OpenAiResponsesStreamState::default();
+            futures::pin_mut!(event_stream);
+            while let Some(ev) = event_stream.next().await {
+                let chunks = match ev {
+                    Ok(event) => match state.feed_data(&event.data) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(ModelClientError::Network(format!(
+                                "SSE transport error: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                for c in chunks {
+                    if tx.send(Ok(c)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            // Same clean-vs-cut-off discipline as the OpenAI chat path: a
+            // terminal `response.*` event marks a legitimate end. Without
+            // one, the connection dropped mid-response and we must surface a
+            // retryable error rather than fabricate a completed answer.
+            if state.ended_cleanly() {
+                if let Some(done) = state.finalize() {
+                    let _ = tx.send(Ok(done)).await;
+                }
+            } else {
+                let _ = tx
+                    .send(Err(ModelClientError::Network(
+                        "model stream closed before completion (no terminal response event) \
+                         — connection dropped or upstream truncated the response"
+                            .into(),
+                    )))
+                    .await;
+            }
+        });
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+    }
+}
+
+/// State machine turning Responses SSE events into `ModelChunk`s. Events are
+/// dispatched on the `type` field inside each `data:` payload (more reliable
+/// than the SSE `event:` line). Lives outside the trait impl so the parsing
+/// is unit-testable without an HTTP server.
+#[derive(Debug, Default)]
+struct OpenAiResponsesStreamState {
+    /// First `response.id` we see; used as a fallback text/msg id.
+    response_id: Option<String>,
+    /// Maps a `function_call` item id (`fc_...`) to its `call_id`
+    /// (`call_...`). Arguments deltas arrive keyed by the item id, but the
+    /// harness pairs tool results by `call_id`, so we route through this.
+    fc_call_by_item: std::collections::HashMap<String, String>,
+    /// `"{item_id}:{summary_index}"` keys for reasoning-summary parts that
+    /// have already emitted a text delta. Used to prefix a part boundary to
+    /// the first real text of parts after index 0.
+    summary_parts_seen: std::collections::HashSet<String>,
+    stop_reason: Option<String>,
+    pending_usage: Option<HarnessUsage>,
+    done_emitted: bool,
+    /// Set once a terminal `response.*` event (completed / incomplete /
+    /// failed) lands, distinguishing a clean end from a dropped connection.
+    saw_terminal: bool,
+}
+
+impl OpenAiResponsesStreamState {
+    fn feed_data(&mut self, data: &str) -> Result<Vec<ModelChunk>, ModelClientError> {
+        let trimmed = data.trim();
+        // Responses uses terminal `response.*` events, not `[DONE]`, but
+        // tolerate an empty keepalive frame or a stray sentinel.
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(vec![]);
+        }
+        let value: Value = serde_json::from_str(trimmed).map_err(|e| {
+            ModelClientError::Other(format!("Responses SSE data not JSON: {e}; raw={trimmed}"))
+        })?;
+        let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Latch the response id from any event that carries it.
+        if let Some(rid) = value
+            .get("response")
+            .and_then(|r| r.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            if self.response_id.is_none() && !rid.is_empty() {
+                self.response_id = Some(rid.to_string());
+            }
+        }
+
+        let mut out: Vec<ModelChunk> = Vec::new();
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        let msg_id = value
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or_else(|| self.response_id.clone())
+                            .unwrap_or_else(|| "msg_responses_default".into());
+                        out.push(ModelChunk::TextDelta {
+                            msg_id,
+                            delta: delta.to_string(),
+                        });
+                    }
+                }
+            }
+            // Summary reasoning. A summary can arrive as multiple parts, each
+            // keyed by an incrementing `summary_index`. The harness thinking
+            // model is a single text stream (no per-part structure to fill),
+            // so we preserve the boundary by prefixing a blank line to the
+            // FIRST real text delta of every part after the first. We key off
+            // the text delta — not the structural `..._part.added` event — so
+            // the separator only ever rides genuine model output (a bare
+            // separator on a structural event would register as "progress" in
+            // the agent loop and could persist for an empty part).
+            //
+            // `response.reasoning_summary.delta` is an alias some
+            // Responses-compatible gateways emit instead of the `_text`
+            // variant; accept both so their reasoning summaries aren't lost.
+            "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta" => {
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        let item_id = value
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("reasoning-0");
+                        let idx = value
+                            .get("summary_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        // `insert` returns true the first time we see this
+                        // (item, part) — that's the part's first text delta.
+                        let first_of_part =
+                            self.summary_parts_seen.insert(format!("{item_id}:{idx}"));
+                        let text = if first_of_part && idx > 0 {
+                            format!("\n\n{delta}")
+                        } else {
+                            delta.to_string()
+                        };
+                        out.push(ModelChunk::ThinkingDelta {
+                            thinking_id: item_id.to_string(),
+                            delta: text,
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            // Non-summary reasoning text is a single stream — no part
+            // boundaries to bridge.
+            "response.reasoning_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        let thinking_id = value
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("reasoning-0")
+                            .to_string();
+                        out.push(ModelChunk::ThinkingDelta {
+                            thinking_id,
+                            delta: delta.to_string(),
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            "response.output_item.added" => {
+                if let Some(item) = value.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                        let fc_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(fc_id);
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !call_id.is_empty() {
+                            if !fc_id.is_empty() {
+                                self.fc_call_by_item
+                                    .insert(fc_id.to_string(), call_id.to_string());
+                            }
+                            out.push(ModelChunk::ToolCallStart {
+                                id: call_id.to_string(),
+                                name,
+                            });
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = value.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        let call_id = self
+                            .fc_call_by_item
+                            .get(item_id)
+                            .cloned()
+                            .unwrap_or_else(|| item_id.to_string());
+                        out.push(ModelChunk::ToolCallInputDelta {
+                            id: call_id,
+                            delta: delta.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = value.get("item") {
+                    let itype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if itype == "function_call" {
+                        let fc_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let call_id = self
+                            .fc_call_by_item
+                            .get(fc_id)
+                            .cloned()
+                            .or_else(|| {
+                                item.get("call_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            })
+                            .unwrap_or_else(|| fc_id.to_string());
+                        // Defensive: if we never saw `output_item.added` for
+                        // this call, synthesize the start so the folder has a
+                        // tool_state to attach the end to.
+                        if !fc_id.is_empty() && !self.fc_call_by_item.contains_key(fc_id) {
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            out.push(ModelChunk::ToolCallStart {
+                                id: call_id.clone(),
+                                name,
+                            });
+                            self.fc_call_by_item
+                                .insert(fc_id.to_string(), call_id.clone());
+                        }
+                        // The done item carries the complete argument string;
+                        // parse it as authoritative early input when present.
+                        let input = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+                        out.push(ModelChunk::ToolCallEnd { id: call_id, input });
+                    } else if itype == "reasoning" {
+                        // Capture the encrypted reasoning payload and fold it
+                        // into a signature-only ThinkingDelta so the final
+                        // ChatMessage::Assistant.thinking carries it for
+                        // round-trip on the next turn.
+                        let rid = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(enc) = item
+                            .get("encrypted_content")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            if !rid.is_empty() {
+                                out.push(ModelChunk::ThinkingDelta {
+                                    thinking_id: rid.to_string(),
+                                    delta: String::new(),
+                                    signature: Some(encode_reasoning_signature(rid, enc)),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                self.saw_terminal = true;
+                let resp = value.get("response");
+                self.pending_usage = parse_responses_usage(resp.and_then(|r| r.get("usage")));
+                let reason = resp
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str());
+                self.stop_reason = Some(map_responses_stop_reason(reason));
+                if let Some(done) = self.emit_done() {
+                    out.push(done);
+                }
+            }
+            "response.failed" => {
+                self.saw_terminal = true;
+                let err = value.get("response").and_then(|r| r.get("error"));
+                let code = err
+                    .and_then(|e| e.get("code"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let message = err
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Responses response failed");
+                return Err(classify_responses_error(code, message));
+            }
+            "error" => {
+                self.saw_terminal = true;
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Responses stream error");
+                return Err(classify_responses_error(code, message));
+            }
+            // forward-compat: ignore unknown / display-only event types
+            // (response.created, *.output_text.done, *_part.added, ping, …)
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    fn finalize(&mut self) -> Option<ModelChunk> {
+        self.emit_done()
+    }
+
+    fn ended_cleanly(&self) -> bool {
+        self.saw_terminal || self.done_emitted
+    }
+
+    fn emit_done(&mut self) -> Option<ModelChunk> {
+        if self.done_emitted {
+            return None;
+        }
+        self.done_emitted = true;
+        Some(ModelChunk::Done {
+            stop_reason: self
+                .stop_reason
+                .clone()
+                .unwrap_or_else(|| "end_turn".into()),
+            usage: self.pending_usage.take(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3466,5 +4250,360 @@ mod tests {
             panic!("expected final message after tool result");
         };
         assert!(text.contains("completed"));
+    }
+
+    // ─── OpenAI Responses API ────────────────────────────────────────────
+
+    #[test]
+    fn responses_client_builds_responses_endpoint_and_body() {
+        let mk = |base: &str| {
+            OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+                base_url: base.into(),
+                api_key: "sk-test".into(),
+                model: "gpt-5".into(),
+                temperature: None,
+                max_output_tokens: Some(2048),
+                reasoning_effort: Some("high".into()),
+                reasoning_summary: None,
+            })
+        };
+        // Route appended; version segment respected; no double-append.
+        assert_eq!(
+            mk("https://api.openai.com/v1").endpoint(),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            mk("https://api.openai.com/v1/").endpoint(),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            mk("https://api.openai.com/v1/responses").endpoint(),
+            "https://api.openai.com/v1/responses"
+        );
+
+        let client = mk("https://api.openai.com/v1");
+        let mut input = user("hello");
+        input.system_prompt = Some("be terse".into());
+        input.tools = vec![bash_spec()];
+        let body = client.request_body(&input);
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // Stateless mode requests encrypted reasoning for round-trip.
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        // Flat tool shape (not nested under `function`).
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert!(body["tools"][0]["parameters"].is_object());
+        assert_eq!(body["tool_choice"], "auto");
+        // User message projects to an input_text content part.
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn responses_tool_choice_none_drops_client_and_hosted_tools() {
+        let client = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-5".into(),
+            temperature: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+        });
+        let mut input = user("hi");
+        input.tools = vec![bash_spec()];
+        input.hosted_tools = vec![HostedTool::WebSearch { max_uses: None }];
+        input.tool_choice = ToolChoice::None;
+        let body = client.request_body(&input);
+        // `None` means no tools this turn — that MUST also suppress hosted
+        // (provider-run) tools, else server-side web_search could still fire.
+        assert!(
+            body.get("tools").is_none(),
+            "tools should be absent, got {:?}",
+            body.get("tools")
+        );
+        assert!(body.get("tool_choice").is_none());
+
+        // Sanity: with Auto, both the function tool and the hosted web_search
+        // are advertised.
+        input.tool_choice = ToolChoice::Auto;
+        let body = client.request_body(&input);
+        let tools = body["tools"].as_array().expect("tools present");
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|t| t["type"] == "function"));
+        assert!(tools.iter().any(|t| t["type"] == "web_search"));
+    }
+
+    #[test]
+    fn responses_tool_choice_required_sent_for_hosted_only() {
+        let client = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-5".into(),
+            temperature: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+        });
+        // Hosted tool only — no client function tools.
+        let mut input = user("search the web");
+        input.hosted_tools = vec![HostedTool::WebSearch { max_uses: None }];
+
+        // Required must be sent even without function tools, else it silently
+        // downgrades to the default auto.
+        input.tool_choice = ToolChoice::Required;
+        let body = client.request_body(&input);
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(body["tool_choice"], "required");
+
+        // Tool(name) force-selects a FUNCTION tool; with only a hosted tool
+        // present there's nothing to force, so it must NOT be sent (encoding a
+        // hosted tool as {type:function,name} would 400).
+        input.tool_choice = ToolChoice::Tool("bash".into());
+        let body = client.request_body(&input);
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "Tool(name) must not be sent for a hosted-only turn, got {:?}",
+            body.get("tool_choice")
+        );
+
+        // With a function tool present, Tool(name) IS sent as a function choice.
+        input.tools = vec![bash_spec()];
+        let body = client.request_body(&input);
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["name"], "bash");
+    }
+
+    #[test]
+    fn responses_stream_state_accepts_reasoning_summary_alias() {
+        // Some gateways emit `response.reasoning_summary.delta` instead of the
+        // `_text` variant — both must surface as thinking.
+        let mut st = OpenAiResponsesStreamState::default();
+        let chunks = st
+            .feed_data(
+                r#"{"type":"response.reasoning_summary.delta","item_id":"rs_1","summary_index":0,"delta":"aliased"}"#,
+            )
+            .expect("feed_data");
+        assert!(
+            matches!(&chunks[0], ModelChunk::ThinkingDelta { delta, .. } if delta == "aliased")
+        );
+    }
+
+    #[test]
+    fn responses_stream_state_separates_reasoning_summary_parts() {
+        let mut st = OpenAiResponsesStreamState::default();
+        let mut chunks: Vec<ModelChunk> = Vec::new();
+        let mut feed = |st: &mut OpenAiResponsesStreamState, data: &str| {
+            chunks.extend(st.feed_data(data).expect("feed_data"));
+        };
+        // The separator rides the FIRST real text delta of a later part — not
+        // the structural `part.added` event — so it only ever attaches to
+        // genuine model output. Part 0 gets no prefix; part 1's first delta
+        // is prefixed with a blank line; subsequent deltas of a part are not.
+        feed(
+            &mut st,
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":0}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"first"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":" more"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":1}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":1,"delta":"second"}"#,
+        );
+        let deltas: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                ModelChunk::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        // `part.added` produces nothing; the boundary is folded into the
+        // first text delta of part 1.
+        assert_eq!(deltas, vec!["first", " more", "\n\nsecond"]);
+    }
+
+    #[test]
+    fn responses_input_projection_round_trips_tool_calls_and_reasoning() {
+        let sig = encode_reasoning_signature("rs_123", "ENC==");
+        let messages = vec![
+            ChatMessage::User {
+                content: "hi".into(),
+                attachments: vec![],
+            },
+            ChatMessage::Assistant {
+                text: Some("looked".into()),
+                tool_calls: vec![ToolInvocation {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                    raw_emitted_args: None,
+                }],
+                thinking: Some(AssistantThinking {
+                    text: "let me look".into(),
+                    signature: Some(sig),
+                }),
+                usage: None,
+            },
+            ChatMessage::Tool {
+                tool_call_id: "call_1".into(),
+                content: "file.txt".into(),
+                is_error: false,
+                attachments: vec![],
+            },
+        ];
+        let input = chat_messages_to_responses_input(&messages);
+        assert_eq!(input[0]["role"], "user");
+        // Reasoning item precedes text + tool call, carrying encrypted payload.
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_123");
+        assert_eq!(input[1]["encrypted_content"], "ENC==");
+        assert_eq!(input[1]["summary"][0]["text"], "let me look");
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[2]["content"][0]["type"], "output_text");
+        // Tool call keyed by call_id (the harness's pairing key).
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["name"], "bash");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_1");
+        assert_eq!(input[4]["output"], "file.txt");
+    }
+
+    #[test]
+    fn responses_stream_state_emits_text_toolcall_and_done() {
+        let mut st = OpenAiResponsesStreamState::default();
+        let mut chunks: Vec<ModelChunk> = Vec::new();
+        let mut feed = |st: &mut OpenAiResponsesStreamState, data: &str| {
+            chunks.extend(st.feed_data(data).expect("feed_data"));
+        };
+        feed(
+            &mut st,
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"Hel"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"lo"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash"}}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\"ls\"}"}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}}"#,
+        );
+        feed(
+            &mut st,
+            r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":2}}}}"#,
+        );
+
+        assert!(matches!(&chunks[0], ModelChunk::TextDelta { delta, .. } if delta == "Hel"));
+        assert!(matches!(&chunks[1], ModelChunk::TextDelta { delta, .. } if delta == "lo"));
+        assert!(
+            matches!(&chunks[2], ModelChunk::ToolCallStart { id, name } if id == "call_1" && name == "bash")
+        );
+        assert!(matches!(&chunks[3], ModelChunk::ToolCallInputDelta { id, .. } if id == "call_1"));
+        assert!(matches!(&chunks[4], ModelChunk::ToolCallInputDelta { id, .. } if id == "call_1"));
+        match &chunks[5] {
+            ModelChunk::ToolCallEnd { id, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(input.as_ref().expect("early input")["command"], "ls");
+            }
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
+        match chunks.last().expect("done chunk") {
+            ModelChunk::Done { stop_reason, usage } => {
+                assert_eq!(stop_reason, "end_turn");
+                let u = usage.as_ref().expect("usage");
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.output_tokens, 5);
+                assert_eq!(u.cache_read_input_tokens, 2);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        assert!(st.ended_cleanly());
+    }
+
+    #[test]
+    fn responses_stream_state_round_trips_reasoning_signature() {
+        let mut st = OpenAiResponsesStreamState::default();
+        let mut chunks: Vec<ModelChunk> = Vec::new();
+        chunks.extend(
+            st.feed_data(
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"pondering"}"#,
+            )
+            .unwrap(),
+        );
+        chunks.extend(
+            st.feed_data(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC=="}}"#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            matches!(&chunks[0], ModelChunk::ThinkingDelta { delta, signature, .. } if delta == "pondering" && signature.is_none())
+        );
+        match &chunks[1] {
+            ModelChunk::ThinkingDelta {
+                delta, signature, ..
+            } => {
+                assert!(delta.is_empty());
+                let (id, enc) =
+                    decode_reasoning_signature(signature.as_ref().expect("signature")).unwrap();
+                assert_eq!(id, "rs_1");
+                assert_eq!(enc, "ENC==");
+            }
+            other => panic!("expected ThinkingDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_stream_state_reports_cutoff_without_terminal_event() {
+        let mut st = OpenAiResponsesStreamState::default();
+        st.feed_data(r#"{"type":"response.output_text.delta","item_id":"m","delta":"hi"}"#)
+            .unwrap();
+        // No terminal `response.*` event arrived → the stream was cut off.
+        assert!(!st.ended_cleanly());
+    }
+
+    #[test]
+    fn reasoning_signature_encode_decode_roundtrip() {
+        let sig = encode_reasoning_signature("rs_abc", "base64==payload");
+        assert_eq!(
+            decode_reasoning_signature(&sig),
+            Some(("rs_abc".into(), "base64==payload".into()))
+        );
+        // A plain (non-Responses) signature has no newline → not decodable,
+        // so it is never mis-projected as a reasoning item.
+        assert_eq!(decode_reasoning_signature("anthropic-sig-no-newline"), None);
     }
 }

@@ -33,8 +33,8 @@ pub use mcp::{
 pub use model::{
     collect_model_response, AnthropicConfig, AnthropicModelClient, AssistantThinking, ChatMessage,
     HostedTool, ImageData, ImageSource, ModelChunk, ModelClient, ModelClientError, ModelResponse,
-    ModelTurnInput, OpenAiCompatibleConfig, OpenAiCompatibleModelClient, ScriptedModelClient,
-    ToolChoice, UserAttachment,
+    ModelTurnInput, OpenAiCompatibleConfig, OpenAiCompatibleModelClient, OpenAiResponsesConfig,
+    OpenAiResponsesModelClient, ScriptedModelClient, ToolChoice, UserAttachment,
 };
 pub use runner::{FakeNativeHarness, NativeHarness, ToolCapableFakeHarness};
 pub use shell_risk::{
