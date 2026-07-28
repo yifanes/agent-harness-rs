@@ -666,47 +666,58 @@ async fn run_loop<M, R>(
                     }
                 }
 
-                // Dispatch ALL invocations concurrently. Each tool runs
-                // in its own task so InterruptDispatch can return a clean
-                // TurnEnd immediately while cancellation-aware runtimes
-                // (notably E2B SandboxToolRuntime) keep polling long
-                // enough to SIGTERM their remote process.
-                let handles = invocations.iter().cloned().map(|inv| {
+                // Dispatch all invocations concurrently in one aggregate future.
+                // Keeping them out of detached Tokio tasks is important: if the
+                // turn is cancelled, dropping `join` below drops every tool
+                // future, so a runtime that ignores the cancellation token cannot
+                // keep mutating state after TurnEnd.
+                let calls = invocations.iter().cloned().map(|inv| {
                     let tools = tools.clone();
                     let cancel_for_task = cancel_token.clone();
                     let invocation_for_task = inv.clone();
-                    let handle = tokio::spawn(async move {
-                        tools
-                            .invoke_cancellable(invocation_for_task, cancel_for_task.as_ref())
-                            .await
-                    });
-                    (inv, handle)
+                    async move {
+                        let call = tools.invoke_cancellable(
+                            invocation_for_task,
+                            cancel_for_task.as_ref(),
+                        );
+                        let outcome = match std::panic::AssertUnwindSafe(call).catch_unwind().await {
+                            Ok(outcome) => outcome,
+                            Err(payload) => Err(ToolRuntimeError::Runtime(format!(
+                                "tool task panicked: {}",
+                                panic_payload_to_string(payload.as_ref())
+                            ))),
+                        };
+                        (inv, outcome)
+                    }
                 });
-                let join = futures::future::join_all(handles.map(|(inv, handle)| async move {
-                    let outcome = match handle.await {
-                        Ok(outcome) => outcome,
-                        Err(e) => Err(ToolRuntimeError::Runtime(format!("tool task failed: {e}"))),
-                    };
-                    (inv, outcome)
-                }));
+                let join = futures::future::join_all(calls);
+                tokio::pin!(join);
 
                 let pairs_opt = if let Some(token) = cancel_token.as_ref() {
                     tokio::select! {
                         biased;
-                        _ = token.cancelled() => None,
-                        results = join => Some(results),
+                        _ = token.cancelled() => {
+                            // Give cancellation-aware runtimes a brief window to
+                            // perform remote cleanup (for example E2B SendSignal).
+                            // On expiry, dropping `join` below cancels all remaining
+                            // in-process futures; none are detached.
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(1),
+                                &mut join,
+                            ).await;
+                            None
+                        },
+                        results = &mut join => Some(results),
                     }
                 } else {
-                    Some(join.await)
+                    Some((&mut join).await)
                 };
                 let pairs = match pairs_opt {
                     Some(o) => o,
                     None => {
-                        // Cancel won the select — emit interrupt
-                        // TurnEnd and return. Tool tasks remain detached
-                        // so cancellation-aware runtimes can terminate
-                        // their remote process; their results aren't
-                        // surfaced after the turn has ended.
+                        // Cancel won the select. Cancellation-aware runtimes had
+                        // an opportunity to clean up, and all remaining futures
+                        // are dropped when this scope returns.
                         let _ = tx
                             .send(Ok(HarnessInternalEvent::TurnEnd {
                                 stop_reason: "interrupt".into(),
@@ -3062,6 +3073,95 @@ mod tests {
             cancelled_count.load(Ordering::SeqCst),
             1,
             "tool runtime must observe the cancellation token"
+        );
+    }
+
+    #[derive(Clone)]
+    struct DefaultCancellationProbe {
+        started: Arc<tokio::sync::Notify>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolRuntime for DefaultCancellationProbe {
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            vec![crate::tools::ToolSpec {
+                name: "slow".into(),
+                description: "records a delayed side effect".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        async fn invoke(
+            &self,
+            _invocation: ToolInvocation,
+        ) -> Result<ToolOutcome, ToolRuntimeError> {
+            self.started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            self.completed.store(true, Ordering::SeqCst);
+            Ok(ToolOutcome {
+                output: Ok(serde_json::json!({"completed": true})),
+                attachments: vec![],
+            })
+        }
+    }
+
+    /// The default `ToolRuntime::invoke_cancellable` must drop an invocation
+    /// that does not implement custom cancellation. Before the fix, the agent
+    /// loop detached its task and the delayed side effect happened after
+    /// TurnEnd{interrupt}.
+    #[tokio::test]
+    async fn agent_loop_cancel_drops_default_tool_future() {
+        let model = StreamingFakeClient::new(vec![vec![
+            ModelChunk::ToolCallStart {
+                id: "tc_slow".into(),
+                name: "slow".into(),
+            },
+            ModelChunk::ToolCallEnd {
+                id: "tc_slow".into(),
+                input: Some(json!({})),
+            },
+            ModelChunk::Done {
+                stop_reason: "tool_use".into(),
+                usage: None,
+            },
+        ]]);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = DefaultCancellationProbe {
+            started: started.clone(),
+            completed: completed.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let harness = AgentLoopHarness::new(model, runtime);
+        let mut rx = harness
+            .run_turn(NativeTurnInput {
+                prompt_text: "go".into(),
+                system_prompt: None,
+                attachments: vec![],
+                cancel_token: Some(cancel.clone()),
+                prior_messages: vec![],
+                context_path: None,
+            })
+            .await
+            .unwrap();
+
+        started.notified().await;
+        cancel.cancel();
+
+        let mut saw_interrupt = false;
+        while let Some(item) = rx.recv().await {
+            if let HarnessInternalEvent::TurnEnd { stop_reason, .. } = item.unwrap() {
+                assert_eq!(stop_reason, "interrupt");
+                saw_interrupt = true;
+                break;
+            }
+        }
+        assert!(saw_interrupt);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "cancelled tool produced a side effect after TurnEnd"
         );
     }
 

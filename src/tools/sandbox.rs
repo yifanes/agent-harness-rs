@@ -151,15 +151,28 @@ impl<E: SandboxExecutor + Clone + Send + Sync + 'static> ToolRuntime for Sandbox
             }
         }
 
-        match inv.name.as_str() {
-            "bash"  => self.sandbox_bash(inv).await,
-            "read"  => self.sandbox_read(inv).await,
-            "write" => self.sandbox_write(inv).await,
-            "edit"  => self.sandbox_edit(inv).await,
-            "glob"  => self.sandbox_glob(inv).await,
-            "grep"  => self.sandbox_grep(inv).await,
-            "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
-            other   => Err(ToolRuntimeError::UnknownTool(other.into())),
+        let call = async {
+            match inv.name.as_str() {
+                "bash"  => self.sandbox_bash(inv).await,
+                "read"  => self.sandbox_read(inv).await,
+                "write" => self.sandbox_write(inv).await,
+                "edit"  => self.sandbox_edit(inv).await,
+                "glob"  => self.sandbox_glob(inv).await,
+                "grep"  => self.sandbox_grep(inv).await,
+                "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
+                other   => Err(ToolRuntimeError::UnknownTool(other.into())),
+            }
+        };
+        if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    Err(ToolRuntimeError::Runtime("cancelled".into()))
+                }
+                outcome = call => outcome,
+            }
+        } else {
+            call.await
         }
     }
 }

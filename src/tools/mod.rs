@@ -222,19 +222,26 @@ pub trait ToolRuntime: Send + Sync {
     /// shell subprocess for `bash`) and return `ToolRuntimeError::
     /// Runtime("cancelled")`.
     ///
-    /// Default impl ignores the cancel handle and delegates to
-    /// `invoke` — agent_loop layers a `tokio::select!` on top so the
-    /// outer future is dropped on cancel even when the inner runtime
-    /// can't propagate. The cost is a leaked tool-side process until
-    /// it exits naturally; runtimes whose tools can take minutes
-    /// (shells, network tools) should override this to forward the
-    /// signal.
+    /// The default implementation races `invoke` against cancellation. This
+    /// drops the invocation future when cancelled, which prevents in-process
+    /// work from continuing after the turn ends. Runtimes that start work in
+    /// an external system should override this and explicitly terminate it.
     async fn invoke_cancellable(
         &self,
         invocation: ToolInvocation,
-        _cancel: Option<&tokio_util::sync::CancellationToken>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<ToolOutcome, ToolRuntimeError> {
-        self.invoke(invocation).await
+        if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    Err(ToolRuntimeError::Runtime("cancelled".into()))
+                }
+                outcome = self.invoke(invocation) => outcome,
+            }
+        } else {
+            self.invoke(invocation).await
+        }
     }
 }
 

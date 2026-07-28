@@ -198,8 +198,7 @@ impl E2bExecutor {
         Ok(h)
     }
 
-    /// Unary Connect call — used for SendSignal (future kill support).
-    #[allow(dead_code)]
+    /// Unary Connect call used by process-control operations.
     async fn unary<Req: Message, Resp: Message + Default>(
         &self,
         method: &str,
@@ -221,6 +220,36 @@ impl E2bExecutor {
             Err(err.into())
         } else {
             Err(E2bError::Protocol(format!("{method} HTTP {status}")))
+        }
+    }
+
+    async fn kill_process(&self, process: proto::ProcessSelector) -> bool {
+        let request = proto::SendSignalRequest {
+            process: Some(process),
+            signal: proto::Signal::Sigkill as i32,
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.unary::<_, proto::SendSignalResponse>("SendSignal", request),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "harness::e2b",
+                    error = %error,
+                    "failed to terminate E2B process"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "harness::e2b",
+                    "timed out while terminating E2B process"
+                );
+                false
+            }
         }
     }
 
@@ -349,7 +378,15 @@ impl E2bExecutor {
         cwd: Option<&str>,
         timeout_ms: u64,
         on_line: Option<&(dyn Fn(String) + Send + Sync)>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<ExecResult, E2bError> {
+        // A tag lets cleanup address the process even if cancellation happens
+        // before envd has returned the numeric pid.
+        let process_tag = format!("agent-harness-{}", uuid::Uuid::new_v4());
+        let selector = proto::ProcessSelector {
+            selector: Some(proto::process_selector::Selector::Tag(process_tag.clone())),
+        };
+        let mut cleanup = ProcessCleanupGuard::new(self.clone(), selector.clone());
         // Wrap in /bin/bash -l -c to source /etc/profile.d/*.sh
         let cfg = proto::ProcessConfig {
             cmd: "/bin/bash".into(),
@@ -360,15 +397,28 @@ impl E2bExecutor {
         let start_req = proto::StartRequest {
             process: Some(cfg),
             pty: None,
-            tag: None,
+            tag: Some(process_tag),
             stdin: Some(false),
         };
         let mut events_rx = self.server_stream::<_, proto::StartResponse>("Start", start_req);
 
         // Wait for the Start event to get the pid
         let _pid = loop {
-            let next = events_rx.recv().await
-                .ok_or_else(|| E2bError::Protocol("Start stream closed before pid".into()))??;
+            let next = if let Some(token) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        if self.kill_process(selector.clone()).await {
+                            cleanup.disarm();
+                        }
+                        return Err(E2bError::Transport("command cancelled".into()));
+                    }
+                    next = events_rx.recv() => next,
+                }
+            } else {
+                events_rx.recv().await
+            }
+            .ok_or_else(|| E2bError::Protocol("Start stream closed before pid".into()))??;
             let event = next.event.and_then(|e| e.event)
                 .ok_or_else(|| E2bError::Protocol("missing ProcessEvent.event".into()))?;
             match event {
@@ -387,10 +437,27 @@ impl E2bExecutor {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code = -1i32;
+        let mut exited = false;
 
         loop {
             let item = tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(token) = cancel {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if self.kill_process(selector.clone()).await {
+                        cleanup.disarm();
+                    }
+                    return Err(E2bError::Transport("command cancelled".into()));
+                }
                 _ = &mut hard => {
+                    if self.kill_process(selector.clone()).await {
+                        cleanup.disarm();
+                    }
                     return Err(E2bError::Transport(format!(
                         "command timed out after {timeout_ms}ms"
                     )));
@@ -418,13 +485,55 @@ impl E2bExecutor {
                 }
                 proto::process_event::Event::End(e) => {
                     exit_code = e.exit_code;
+                    exited = true;
                     break;
                 }
                 _ => continue,
             }
         }
 
+        if !exited {
+            return Err(E2bError::Protocol(
+                "Start stream closed before process exit".into(),
+            ));
+        }
+        cleanup.disarm();
         Ok(ExecResult { stdout, stderr, exit_code })
+    }
+}
+
+/// Last-resort cleanup for a process whose execution future is dropped, such
+/// as when the enclosing agent turn is cancelled. Normal completion and the
+/// explicit timeout/cancellation branches disarm it.
+struct ProcessCleanupGuard {
+    executor: E2bExecutor,
+    process: Option<proto::ProcessSelector>,
+}
+
+impl ProcessCleanupGuard {
+    fn new(executor: E2bExecutor, process: proto::ProcessSelector) -> Self {
+        Self {
+            executor,
+            process: Some(process),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.process = None;
+    }
+}
+
+impl Drop for ProcessCleanupGuard {
+    fn drop(&mut self) {
+        let Some(process) = self.process.take() else {
+            return;
+        };
+        let executor = self.executor.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = executor.kill_process(process).await;
+            });
+        }
     }
 }
 
@@ -436,7 +545,7 @@ impl SandboxExecutor for E2bExecutor {
         cwd: Option<&str>,
         timeout_ms: u64,
     ) -> Result<ExecResult, String> {
-        self.run_process(command, cwd, timeout_ms, None)
+        self.run_process(command, cwd, timeout_ms, None, None)
             .await
             .map_err(|e| e.to_string())
     }
@@ -448,7 +557,7 @@ impl SandboxExecutor for E2bExecutor {
         timeout_ms: u64,
         on_line: &(dyn Fn(String) + Send + Sync),
     ) -> Result<ExecResult, String> {
-        self.run_process(command, cwd, timeout_ms, Some(on_line))
+        self.run_process(command, cwd, timeout_ms, Some(on_line), None)
             .await
             .map_err(|e| e.to_string())
     }
@@ -570,15 +679,30 @@ impl ToolRuntime for E2bToolRuntime {
             }
         }
 
-        match inv.name.as_str() {
-            "bash"  => self.e2b_bash(inv).await,
-            "read"  => self.e2b_read(inv).await,
-            "write" => self.e2b_write(inv).await,
-            "edit"  => self.e2b_edit(inv).await,
-            "glob"  => self.e2b_glob(inv).await,
-            "grep"  => self.e2b_grep(inv).await,
-            "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
-            other   => Err(ToolRuntimeError::UnknownTool(other.into())),
+        if inv.name == "bash" {
+            return self.e2b_bash(inv, cancel).await;
+        }
+        let call = async {
+            match inv.name.as_str() {
+                "read"  => self.e2b_read(inv).await,
+                "write" => self.e2b_write(inv).await,
+                "edit"  => self.e2b_edit(inv).await,
+                "glob"  => self.e2b_glob(inv).await,
+                "grep"  => self.e2b_grep(inv).await,
+                "web_fetch" => crate::tools::web_fetch::invoke(inv).await,
+                other   => Err(ToolRuntimeError::UnknownTool(other.into())),
+            }
+        };
+        if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    Err(ToolRuntimeError::Runtime("cancelled".into()))
+                }
+                outcome = call => outcome,
+            }
+        } else {
+            call.await
         }
     }
 }
@@ -603,7 +727,11 @@ impl E2bToolRuntime {
         )
     }
 
-    async fn e2b_bash(&self, inv: ToolInvocation) -> Result<ToolOutcome, ToolRuntimeError> {
+    async fn e2b_bash(
+        &self,
+        inv: ToolInvocation,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<ToolOutcome, ToolRuntimeError> {
         let cmd = req_str(&inv, "command")?;
         let timeout_ms = inv.input.get("timeout_ms")
             .and_then(Value::as_u64)
@@ -611,11 +739,14 @@ impl E2bToolRuntime {
             .min(3_600_000);
 
         let emit = self.emit.clone();
-        let result = self.executor
-            .exec_streaming(cmd, Some(&self.cwd), timeout_ms, &move |line| {
-                emit(json!({ "type": "bash_stdout_line", "line": line }));
-            })
-            .await;
+        let on_line = move |line| {
+            emit(json!({ "type": "bash_stdout_line", "line": line }));
+        };
+        let result = self
+            .executor
+            .run_process(cmd, Some(&self.cwd), timeout_ms, Some(&on_line), cancel)
+            .await
+            .map_err(|e| e.to_string());
 
         match result {
             Err(e) => Ok(ToolOutcome {
