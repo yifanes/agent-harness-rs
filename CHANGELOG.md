@@ -4,6 +4,30 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.12] - 2026-08-13
+
+### Added
+
+- Added `WebSearchMode::{Off, Auto, Native, Managed}` and deterministic
+  native/managed search arbitration. Search now defaults to `Off`.
+- Added `HostedCapability`, `CapabilitySupport`, and
+  `ModelClient::hosted_capability` so search support is determined by the
+  concrete API client and endpoint instead of model-name allowlists.
+- Added the pluggable `WebSearchProvider` contract, `WebSearchToolRuntime`, a
+  normalized managed-search result contract, and a Brave Search adapter.
+
+### Changed
+
+- Replaced the ambiguous no-argument `AgentLoopHarness::with_web_search()`
+  with `with_web_search(WebSearchMode)`.
+- Removed direct public hosted-tool configuration from `AgentLoopHarness` and
+  removed the Anthropic-specific `max_uses` field from the common
+  `HostedTool::WebSearch` representation.
+- `ModelClient` implementations must now explicitly implement
+  `hosted_capability`; the trait no longer supplies a compatibility default.
+- Web-search routing now guarantees that provider-hosted and managed
+  `web_search` are never advertised together.
+
 ## [0.2.11] - 2026-07-15
 
 ### Added

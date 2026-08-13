@@ -11,13 +11,13 @@ use crate::compaction::{
 };
 use crate::event::{HarnessInternalEvent, HarnessUsage, NativeHarnessError, NativeTurnInput};
 use crate::model::{
-    AssistantThinking, ChatMessage, HostedTool, ModelChunk, ModelClient, ModelClientError,
-    ModelTurnInput,
+    AssistantThinking, CapabilitySupport, ChatMessage, HostedCapability, HostedTool, ModelChunk,
+    ModelClient, ModelClientError, ModelTurnInput,
 };
 use crate::runner::NativeHarness;
 use crate::tools::{
     bounded::BoundedToolRuntime, ToolFailure, ToolFailureKind, ToolInvocation, ToolOutcome,
-    ToolRuntime, ToolRuntimeError,
+    ToolRuntime, ToolRuntimeError, ToolSpec,
 };
 
 /// Optional compaction wiring: strategy + the model client used to run
@@ -83,6 +83,23 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// this is set higher (6).
 const DEFAULT_STREAM_MAX_ATTEMPTS: u32 = 6;
 
+/// Selects how web search is exposed for an agent turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchMode {
+    /// Do not expose either provider-hosted or harness-managed web search.
+    #[default]
+    Off,
+    /// Prefer proven provider-hosted search, otherwise use a managed
+    /// `web_search` function tool when the runtime supplies one.
+    Auto,
+    /// Require provider-hosted search. Custom clients reporting `Unknown` are
+    /// allowed to attempt it; explicit `Unsupported` support fails fast.
+    Native,
+    /// Require a harness-managed `web_search` function tool.
+    Managed,
+}
+
 #[derive(Clone)]
 pub struct AgentLoopHarness<M, R> {
     model: M,
@@ -93,7 +110,7 @@ pub struct AgentLoopHarness<M, R> {
     max_steps: usize,
     compaction: Option<CompactionPolicy>,
     tool_choice: crate::model::ToolChoice,
-    hosted_tools: Vec<HostedTool>,
+    web_search: WebSearchMode,
     parallel_tool_calls: Option<bool>,
     stream_idle_timeout: Duration,
     stream_max_attempts: u32,
@@ -107,7 +124,7 @@ impl<M, R: ToolRuntime> AgentLoopHarness<M, R> {
             max_steps: 8,
             compaction: None,
             tool_choice: crate::model::ToolChoice::Auto,
-            hosted_tools: vec![],
+            web_search: WebSearchMode::Off,
             parallel_tool_calls: None,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_max_attempts: DEFAULT_STREAM_MAX_ATTEMPTS,
@@ -140,18 +157,10 @@ impl<M, R: ToolRuntime> AgentLoopHarness<M, R> {
         self
     }
 
-    /// Enable provider-executed hosted tools, such as Anthropic native
-    /// web_search. These tools are not part of `ToolRuntime` and are never
-    /// executed by the harness itself.
-    pub fn with_hosted_tools(mut self, tools: Vec<HostedTool>) -> Self {
-        self.hosted_tools = tools;
-        self
-    }
-
-    /// Convenience helper for provider-native web search.
-    pub fn with_web_search(mut self) -> Self {
-        self.hosted_tools
-            .push(HostedTool::WebSearch { max_uses: None });
+    /// Configure web-search routing. Search is `Off` by default because it may
+    /// incur network egress and provider charges.
+    pub fn with_web_search(mut self, mode: WebSearchMode) -> Self {
+        self.web_search = mode;
         self
     }
 
@@ -193,7 +202,7 @@ where
         let max_steps = self.max_steps;
         let compaction = self.compaction.clone();
         let tool_choice = self.tool_choice.clone();
-        let hosted_tools = self.hosted_tools.clone();
+        let web_search = self.web_search;
         let parallel_tool_calls = self.parallel_tool_calls;
         let stream_idle_timeout = self.stream_idle_timeout;
         let stream_max_attempts = self.stream_max_attempts;
@@ -207,7 +216,7 @@ where
                     max_steps,
                     compaction,
                     tool_choice,
-                    hosted_tools,
+                    web_search,
                     parallel_tool_calls,
                     stream_idle_timeout,
                     stream_max_attempts,
@@ -249,10 +258,46 @@ struct RunLoopConfig {
     max_steps: usize,
     compaction: Option<CompactionPolicy>,
     tool_choice: crate::model::ToolChoice,
-    hosted_tools: Vec<HostedTool>,
+    web_search: WebSearchMode,
     parallel_tool_calls: Option<bool>,
     stream_idle_timeout: Duration,
     stream_max_attempts: u32,
+}
+
+fn resolve_web_search_tools(
+    mode: WebSearchMode,
+    native_support: CapabilitySupport,
+    mut tools: Vec<ToolSpec>,
+) -> Result<(Vec<ToolSpec>, Vec<HostedTool>), String> {
+    let has_managed = tools.iter().any(|tool| tool.name == "web_search");
+    let remove_managed = |tools: &mut Vec<ToolSpec>| {
+        tools.retain(|tool| tool.name != "web_search");
+    };
+
+    match mode {
+        WebSearchMode::Off => {
+            remove_managed(&mut tools);
+            Ok((tools, vec![]))
+        }
+        WebSearchMode::Auto if native_support == CapabilitySupport::Supported => {
+            remove_managed(&mut tools);
+            Ok((tools, vec![HostedTool::WebSearch]))
+        }
+        WebSearchMode::Auto if has_managed => Ok((tools, vec![])),
+        WebSearchMode::Auto => Ok((tools, vec![])),
+        WebSearchMode::Native if native_support == CapabilitySupport::Unsupported => Err(
+            "web search mode is Native, but the model client does not support hosted web search"
+                .into(),
+        ),
+        WebSearchMode::Native => {
+            remove_managed(&mut tools);
+            Ok((tools, vec![HostedTool::WebSearch]))
+        }
+        WebSearchMode::Managed if !has_managed => Err(
+            "web search mode is Managed, but the tool runtime does not provide `web_search`".into(),
+        ),
+        WebSearchMode::Managed => Ok((tools, vec![])),
+    }
 }
 
 async fn run_loop<M, R>(
@@ -268,10 +313,22 @@ async fn run_loop<M, R>(
     let system_prompt = input.system_prompt.clone();
     let cancel_token = input.cancel_token.clone();
     let context_path = input.context_path.clone();
-    // Snapshot tool specs once per turn — adding / removing tools mid-turn
-    // would invalidate cached prompt prefixes on every provider that does
-    // any caching, so we treat the spec list as immutable for one turn.
-    let tools_snapshot = tools.specs();
+    // Snapshot and route web-search tools once per turn. This prevents native
+    // and managed `web_search` from being advertised together and keeps the
+    // provider prompt prefix stable across the inner tool loop.
+    let (tools_snapshot, hosted_tools) = match resolve_web_search_tools(
+        config.web_search,
+        model.hosted_capability(HostedCapability::WebSearch),
+        tools.specs(),
+    ) {
+        Ok(selection) => selection,
+        Err(message) => {
+            let _ = tx
+                .send(Err(NativeHarnessError::ModelBadRequest(message)))
+                .await;
+            return;
+        }
+    };
     // Seed history: load from context JSONL when a path is provided
     // (persistent mode), otherwise use the in-memory prior_messages.
     let mut messages: Vec<ChatMessage> = if let Some(ref path) = context_path {
@@ -425,7 +482,7 @@ async fn run_loop<M, R>(
             system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             tools: tools_snapshot.clone(),
-            hosted_tools: config.hosted_tools.clone(),
+            hosted_tools: hosted_tools.clone(),
             tool_choice: config.tool_choice.clone(),
             parallel_tool_calls: config.parallel_tool_calls,
         };
@@ -676,11 +733,10 @@ async fn run_loop<M, R>(
                     let cancel_for_task = cancel_token.clone();
                     let invocation_for_task = inv.clone();
                     async move {
-                        let call = tools.invoke_cancellable(
-                            invocation_for_task,
-                            cancel_for_task.as_ref(),
-                        );
-                        let outcome = match std::panic::AssertUnwindSafe(call).catch_unwind().await {
+                        let call =
+                            tools.invoke_cancellable(invocation_for_task, cancel_for_task.as_ref());
+                        let outcome = match std::panic::AssertUnwindSafe(call).catch_unwind().await
+                        {
                             Ok(outcome) => outcome,
                             Err(payload) => Err(ToolRuntimeError::Runtime(format!(
                                 "tool task panicked: {}",
@@ -1257,6 +1313,80 @@ mod tests {
     use crate::{HarnessInternalEvent, MockToolRuntime, ScriptedModelClient};
     use async_trait::async_trait;
     use futures::stream::{BoxStream, StreamExt};
+
+    fn search_spec() -> crate::tools::ToolSpec {
+        crate::tools::web_search::web_search_spec()
+    }
+
+    fn ordinary_spec() -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: "read".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn web_search_mode_routes_exactly_one_search_surface() {
+        let both = || vec![ordinary_spec(), search_spec()];
+
+        let (tools, hosted) =
+            resolve_web_search_tools(WebSearchMode::Off, CapabilitySupport::Supported, both())
+                .unwrap();
+        assert!(tools.iter().all(|tool| tool.name != "web_search"));
+        assert!(hosted.is_empty());
+
+        let (tools, hosted) =
+            resolve_web_search_tools(WebSearchMode::Auto, CapabilitySupport::Supported, both())
+                .unwrap();
+        assert!(tools.iter().all(|tool| tool.name != "web_search"));
+        assert_eq!(hosted, vec![HostedTool::WebSearch]);
+
+        for support in [CapabilitySupport::Unsupported, CapabilitySupport::Unknown] {
+            let (tools, hosted) =
+                resolve_web_search_tools(WebSearchMode::Auto, support, both()).unwrap();
+            assert!(tools.iter().any(|tool| tool.name == "web_search"));
+            assert!(hosted.is_empty());
+        }
+
+        let (tools, hosted) =
+            resolve_web_search_tools(WebSearchMode::Native, CapabilitySupport::Unknown, both())
+                .unwrap();
+        assert!(tools.iter().all(|tool| tool.name != "web_search"));
+        assert_eq!(hosted, vec![HostedTool::WebSearch]);
+
+        assert!(resolve_web_search_tools(
+            WebSearchMode::Native,
+            CapabilitySupport::Unsupported,
+            both(),
+        )
+        .is_err());
+
+        let (tools, hosted) =
+            resolve_web_search_tools(WebSearchMode::Managed, CapabilitySupport::Supported, both())
+                .unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(hosted.is_empty());
+
+        assert!(resolve_web_search_tools(
+            WebSearchMode::Managed,
+            CapabilitySupport::Supported,
+            vec![ordinary_spec()],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn auto_without_any_search_surface_degrades_to_no_search() {
+        let (tools, hosted) = resolve_web_search_tools(
+            WebSearchMode::Auto,
+            CapabilitySupport::Unknown,
+            vec![ordinary_spec()],
+        )
+        .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(hosted.is_empty());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1278,6 +1408,10 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for QueueModelClient {
+        fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+            CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             _input: ModelTurnInput,
@@ -1509,6 +1643,10 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for StreamingFakeClient {
+        fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+            CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             _input: ModelTurnInput,
@@ -2216,6 +2354,10 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for RecordingFakeClient {
+        fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+            CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             input: ModelTurnInput,
@@ -2317,6 +2459,10 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for HangingModelClient {
+        fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+            CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             _input: ModelTurnInput,
@@ -2426,6 +2572,10 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for StallingModelClient {
+        fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+            CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             _input: ModelTurnInput,

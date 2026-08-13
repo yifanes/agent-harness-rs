@@ -12,7 +12,7 @@ pub mod skills;
 pub mod tool_repair;
 pub mod tools;
 
-pub use agent_loop::{AgentLoopHarness, CompactionPolicy};
+pub use agent_loop::{AgentLoopHarness, CompactionPolicy, WebSearchMode};
 pub use compaction::{
     estimate_messages_tokens, prune_tool_outputs, resolve_context_window_tokens,
     CompactionContext, CompactionError, CompactionOutcome, CompactionStrategy,
@@ -32,9 +32,10 @@ pub use mcp::{
 };
 pub use model::{
     collect_model_response, AnthropicConfig, AnthropicModelClient, AssistantThinking, ChatMessage,
-    HostedTool, ImageData, ImageSource, ModelChunk, ModelClient, ModelClientError, ModelResponse,
-    ModelTurnInput, OpenAiCompatibleConfig, OpenAiCompatibleModelClient, OpenAiResponsesConfig,
-    OpenAiResponsesModelClient, ScriptedModelClient, ToolChoice, UserAttachment,
+    CapabilitySupport, HostedCapability, HostedTool, ImageData, ImageSource, ModelChunk,
+    ModelClient, ModelClientError, ModelResponse, ModelTurnInput, OpenAiCompatibleConfig,
+    OpenAiCompatibleModelClient, OpenAiResponsesConfig, OpenAiResponsesModelClient,
+    ScriptedModelClient, ToolChoice, UserAttachment,
 };
 pub use runner::{FakeNativeHarness, NativeHarness, ToolCapableFakeHarness};
 pub use shell_risk::{
@@ -50,6 +51,10 @@ pub use tools::{
     EditSearchError, MockToolRuntime, ResolvedEditSearch, ToolFailure, ToolFailureKind,
     ToolInvocation, ToolOutcome, ToolRuntime, ToolRuntimeError, ToolSpec, FS_GLOB_IGNORED_DIRS,
     MAX_FS_GLOB_RESULTS,
+};
+pub use tools::web_search::{
+    web_search_spec, BraveSearchConfig, BraveSearchProvider, WebSearchProvider,
+    WebSearchProviderError, WebSearchRequest, WebSearchResult, WebSearchToolRuntime,
 };
 
 // ── New: local tool runtime ───────────────────────────────────────────────────

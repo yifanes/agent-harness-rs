@@ -2,6 +2,7 @@ pub mod approval;
 pub mod bounded;
 pub mod sandbox;
 pub mod web_fetch;
+pub mod web_search;
 
 #[cfg(feature = "local-tools")]
 pub mod local;
