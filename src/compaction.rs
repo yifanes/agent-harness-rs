@@ -642,6 +642,13 @@ mod tests {
     }
     #[async_trait]
     impl ModelClient for FixedSummaryClient {
+        fn hosted_capability(
+            &self,
+            _capability: crate::model::HostedCapability,
+        ) -> crate::model::CapabilitySupport {
+            crate::model::CapabilitySupport::Unsupported
+        }
+
         async fn stream(
             &self,
             _input: ModelTurnInput,
@@ -1036,6 +1043,13 @@ mod tests {
         struct PanicSummaryClient;
         #[async_trait::async_trait]
         impl ModelClient for PanicSummaryClient {
+            fn hosted_capability(
+                &self,
+                _capability: crate::model::HostedCapability,
+            ) -> crate::model::CapabilitySupport {
+                crate::model::CapabilitySupport::Unsupported
+            }
+
             async fn stream(
                 &self,
                 _: ModelTurnInput,

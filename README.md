@@ -10,7 +10,7 @@ Agent loop harness for building LLM-powered coding agents. Provides a complete r
 
 - **Agent loop** — OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic streaming model clients with retry, reconnect, silent-stop detection, and compaction
 - **Local tools** — `bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch` with approval gate (`feature = "local-tools"`, default)
-- **Hosted tools** — Provider-native tools that execute at the model provider; currently Anthropic native `web_search` and OpenAI Responses hosted `web_search`
+- **Web search routing** — Explicit `Off`, `Auto`, `Native`, or `Managed` policy across provider-hosted search and pluggable managed providers
 - **Sandbox tools** — Generic `SandboxExecutor` trait for any remote sandbox
 - **E2b integration** — `E2bToolRuntime` via Connect Protocol to envd (`feature = "e2b"`)
 - **Context persistence** — JSONL-based context store with incremental append and compaction rewrite
@@ -110,11 +110,14 @@ reasoning is returned, the client requests
 state in `AssistantThinking.signature` so the next turn can replay it without
 using `previous_response_id` or server-side item references.
 
-Hosted `web_search` is available on Responses via the same harness API used for
-other hosted tools:
+Provider-hosted `web_search` is available on Responses through the explicit
+search policy:
 
 ```rust
-let harness = AgentLoopHarness::new(model, tools).with_web_search();
+use harness::WebSearchMode;
+
+let harness = AgentLoopHarness::new(model, tools)
+    .with_web_search(WebSearchMode::Native);
 ```
 
 `ToolChoice::None` suppresses both function tools and hosted tools for that
@@ -162,7 +165,7 @@ the structured `input`.
 ## Web tools
 
 `agent-harness-rs` intentionally separates harness-executed tools from
-provider-executed hosted tools.
+provider-executed hosted tools and chooses exactly one search surface per turn.
 
 ### `web_fetch`
 
@@ -186,34 +189,58 @@ content, caps downloaded bodies at 5 MiB, and returns JSON containing `url`,
 `PlanApproval` treats `web_fetch` as read-only, so planning-mode agents can use
 it alongside `read`, `glob`, and `grep`.
 
-### Hosted `web_search`
+### `web_search` routing
 
-`web_search` is modeled as a provider-hosted tool, not a normal
-`ToolRuntime` tool. The provider executes it server-side and the harness only
-passes the capability through the model request.
+Search is disabled by default because it can incur network egress and provider
+charges. Enable it with an explicit mode:
 
-Currently supported:
+| Mode | Behavior |
+|---|---|
+| `Off` | Advertise neither native nor managed search |
+| `Auto` | Prefer proven native support, otherwise use a runtime `web_search` tool when present |
+| `Native` | Require provider-hosted search; fail fast when explicitly unsupported |
+| `Managed` | Require a runtime-provided `web_search` function tool |
 
-- Anthropic Messages API: `HostedTool::WebSearch` is projected as
-  `{"type":"web_search_20250305","name":"web_search"}`.
-- OpenAI Responses API: `HostedTool::WebSearch` is projected as
-  `{"type":"web_search"}` and executed by the provider.
-- OpenAI-compatible Chat Completions: explicitly unsupported. OpenAI web
-  search requires the Responses API client; this crate fails fast instead of
-  pretending search is available.
-- Other providers: unsupported unless their model client adds a hosted-tool
-  projection.
+`ModelClient::hosted_capability` reports `Supported`, `Unsupported`, or
+`Unknown` for the client's actual API route. Official OpenAI Responses and
+Anthropic endpoints report native web search as supported. OpenAI-compatible
+Chat Completions reports unsupported. Custom endpoints report unknown, so
+`Auto` does not risk sending provider-specific hosted tools to a gateway that
+may reject them; `Native` can be used to force an attempt.
+
+Custom `ModelClient` implementations must make this declaration explicitly;
+there is no capability default and no model-name allowlist.
 
 ```rust
-use harness::{AgentLoopHarness, HostedTool};
+use harness::{AgentLoopHarness, WebSearchMode};
 
-// Convenience: enable Anthropic native web_search with provider defaults.
-let harness = AgentLoopHarness::new(model, tools).with_web_search();
-
-// Or set Anthropic's max_uses cap explicitly.
 let harness = AgentLoopHarness::new(model, tools)
-    .with_hosted_tools(vec![HostedTool::WebSearch { max_uses: Some(3) }]);
+    .with_web_search(WebSearchMode::Auto);
 ```
+
+For managed search, compose `WebSearchToolRuntime` with the normal runtime.
+The managed runtime is separate from built-in tools so a missing search API key
+never creates a tool the application cannot execute:
+
+```rust
+use harness::{
+    AgentLoopHarness, BraveSearchConfig, BraveSearchProvider,
+    CompositeToolRuntime, WebSearchMode, WebSearchToolRuntime,
+};
+use std::sync::Arc;
+
+let search = WebSearchToolRuntime::from_provider(BraveSearchProvider::new(
+    BraveSearchConfig::new(std::env::var("BRAVE_API_KEY")?),
+));
+let tools = CompositeToolRuntime::new(Arc::new(search), Arc::new(local_tools));
+
+let harness = AgentLoopHarness::new(model, tools)
+    .with_web_search(WebSearchMode::Auto);
+```
+
+The managed result contract contains `query`, `provider`, normalized
+`title`/`url`/`snippet` rows, `truncated`, and an `external_content.untrusted`
+marker. Use `web_fetch` to read a selected result in full.
 
 ## Silent-stop detection
 
@@ -229,7 +256,7 @@ successful while delivering no answer and taking no action.
 
 Every behavior change should be recorded in `CHANGELOG.md` before release. This
 project uses patch-only version bumps within the current minor line, so the next
-release after `0.2.10` is `0.2.11`.
+release after `0.2.12` will be `0.2.13`.
 
 ### E2b sandbox
 

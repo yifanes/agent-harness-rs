@@ -185,13 +185,23 @@ pub struct ModelTurnInput {
     pub parallel_tool_calls: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum HostedCapability {
+    WebSearch,
+}
+
+/// Whether a concrete model client can carry a hosted capability over its
+/// current wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HostedTool {
-    WebSearch {
-        /// Anthropic server-tool safety cap. `None` leaves the provider
-        /// default in place.
-        max_uses: Option<u32>,
-    },
+    WebSearch,
 }
 
 /// How the model should route tool selection for the current turn.
@@ -315,6 +325,10 @@ impl ModelClientError {
 
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    /// Report support for provider-executed capabilities on this client's
+    /// actual API path. Automatic routing only selects `Supported` values.
+    fn hosted_capability(&self, capability: HostedCapability) -> CapabilitySupport;
+
     /// Stream the model's response as a sequence of `ModelChunk`s. Production
     /// `ScriptedModelClient` / `OpenAiCompatibleModelClient` implement this;
     /// `next()` is provided as a folding convenience for callers that don't
@@ -784,6 +798,13 @@ fn chat_message_to_wire(msg: &ChatMessage) -> Value {
 
 #[async_trait]
 impl ModelClient for OpenAiCompatibleModelClient {
+    fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+        // Chat Completions has no portable hosted-tool contract. A gateway
+        // calling itself OpenAI-compatible is not evidence that Responses
+        // hosted tools are accepted.
+        CapabilitySupport::Unsupported
+    }
+
     async fn stream(
         &self,
         input: ModelTurnInput,
@@ -1143,6 +1164,10 @@ pub struct ScriptedModelClient;
 
 #[async_trait]
 impl ModelClient for ScriptedModelClient {
+    fn hosted_capability(&self, _capability: HostedCapability) -> CapabilitySupport {
+        CapabilitySupport::Unsupported
+    }
+
     async fn stream(
         &self,
         input: ModelTurnInput,
@@ -1373,6 +1398,14 @@ fn anthropic_tool_choice_value(c: &ToolChoice) -> Value {
 
 #[async_trait]
 impl ModelClient for AnthropicModelClient {
+    fn hosted_capability(&self, capability: HostedCapability) -> CapabilitySupport {
+        match capability {
+            HostedCapability::WebSearch => {
+                official_endpoint_support(&self.config.base_url, &["api.anthropic.com"])
+            }
+        }
+    }
+
     async fn stream(
         &self,
         input: ModelTurnInput,
@@ -1619,16 +1652,10 @@ fn tool_spec_to_anthropic_tool(spec: &ToolSpec) -> Value {
 
 fn hosted_tool_to_anthropic_tool(tool: &HostedTool) -> Value {
     match tool {
-        HostedTool::WebSearch { max_uses } => {
-            let mut value = json!({
-                "type": "web_search_20250305",
-                "name": "web_search",
-            });
-            if let Some(max_uses) = max_uses {
-                value["max_uses"] = json!(max_uses);
-            }
-            value
-        }
+        HostedTool::WebSearch => json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+        }),
     }
 }
 
@@ -2209,7 +2236,7 @@ fn tool_spec_to_responses_tool(spec: &ToolSpec) -> Value {
 /// runs them server-side and streams the result back inline.
 fn hosted_tool_to_responses_tool(tool: &HostedTool) -> Value {
     match tool {
-        HostedTool::WebSearch { .. } => json!({ "type": "web_search" }),
+        HostedTool::WebSearch => json!({ "type": "web_search" }),
     }
 }
 
@@ -2426,6 +2453,14 @@ fn classify_responses_error(code: &str, message: &str) -> ModelClientError {
 
 #[async_trait]
 impl ModelClient for OpenAiResponsesModelClient {
+    fn hosted_capability(&self, capability: HostedCapability) -> CapabilitySupport {
+        match capability {
+            HostedCapability::WebSearch => {
+                official_endpoint_support(&self.config.base_url, &["api.openai.com"])
+            }
+        }
+    }
+
     async fn stream(
         &self,
         input: ModelTurnInput,
@@ -2498,6 +2533,23 @@ impl ModelClient for OpenAiResponsesModelClient {
             }
         });
         Ok(tokio_stream::wrappers::ReceiverStream::new(rx).boxed())
+    }
+}
+
+fn official_endpoint_support(base_url: &str, official_hosts: &[&str]) -> CapabilitySupport {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return CapabilitySupport::Unknown;
+    };
+    let Some(host) = url.host_str() else {
+        return CapabilitySupport::Unknown;
+    };
+    if official_hosts
+        .iter()
+        .any(|official| host.eq_ignore_ascii_case(official))
+    {
+        CapabilitySupport::Supported
+    } else {
+        CapabilitySupport::Unknown
     }
 }
 
@@ -2998,7 +3050,7 @@ mod tests {
                     attachments: vec![],
                 }],
                 tools: vec![],
-                hosted_tools: vec![HostedTool::WebSearch { max_uses: None }],
+                hosted_tools: vec![HostedTool::WebSearch],
                 tool_choice: ToolChoice::Auto,
                 parallel_tool_calls: None,
             })
@@ -3801,7 +3853,7 @@ mod tests {
                 attachments: vec![],
             }],
             tools: vec![bash_spec()],
-            hosted_tools: vec![HostedTool::WebSearch { max_uses: Some(3) }],
+            hosted_tools: vec![HostedTool::WebSearch],
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
         });
@@ -3811,7 +3863,51 @@ mod tests {
             .find(|tool| tool.get("name").and_then(Value::as_str) == Some("web_search"))
             .unwrap();
         assert_eq!(web["type"], "web_search_20250305");
-        assert_eq!(web["max_uses"], 3);
+        assert!(web.get("max_uses").is_none());
+    }
+
+    #[test]
+    fn clients_report_web_search_support_by_protocol_and_endpoint() {
+        let chat = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-test".into(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        });
+        assert_eq!(
+            chat.hosted_capability(HostedCapability::WebSearch),
+            CapabilitySupport::Unsupported
+        );
+
+        let responses = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-test".into(),
+            temperature: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+        });
+        assert_eq!(
+            responses.hosted_capability(HostedCapability::WebSearch),
+            CapabilitySupport::Supported
+        );
+
+        let gateway = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+            base_url: "https://gateway.example/v1".into(),
+            api_key: "sk-test".into(),
+            model: "gpt-test".into(),
+            temperature: None,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+        });
+        assert_eq!(
+            gateway.hosted_capability(HostedCapability::WebSearch),
+            CapabilitySupport::Unknown
+        );
     }
 
     #[test]
@@ -4318,7 +4414,7 @@ mod tests {
         });
         let mut input = user("hi");
         input.tools = vec![bash_spec()];
-        input.hosted_tools = vec![HostedTool::WebSearch { max_uses: None }];
+        input.hosted_tools = vec![HostedTool::WebSearch];
         input.tool_choice = ToolChoice::None;
         let body = client.request_body(&input);
         // `None` means no tools this turn — that MUST also suppress hosted
@@ -4353,7 +4449,7 @@ mod tests {
         });
         // Hosted tool only — no client function tools.
         let mut input = user("search the web");
-        input.hosted_tools = vec![HostedTool::WebSearch { max_uses: None }];
+        input.hosted_tools = vec![HostedTool::WebSearch];
 
         // Required must be sent even without function tools, else it silently
         // downgrades to the default auto.
