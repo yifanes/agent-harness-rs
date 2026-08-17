@@ -25,10 +25,12 @@ const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum WireProtocol {
+    #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
 }
 
@@ -609,6 +611,24 @@ async fn write_cache_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_protocol_uses_stable_external_names() {
+        for (protocol, external) in [
+            (WireProtocol::OpenAiCompatible, "openai_compatible"),
+            (WireProtocol::Anthropic, "anthropic"),
+            (WireProtocol::OpenAiResponses, "openai_responses"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&protocol).unwrap(),
+                format!("\"{external}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<WireProtocol>(&format!("\"{external}\"")).unwrap(),
+                protocol
+            );
+        }
+    }
 
     fn catalog(json: &str) -> ModelCatalog {
         ModelCatalog {
