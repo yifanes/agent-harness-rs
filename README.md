@@ -30,7 +30,8 @@ agent-harness-rs = { version = "0.2", features = ["e2b"] }
 ```rust
 use harness::{
     AgentLoopHarness, NativeTurnInput, OpenAiCompatibleConfig, OpenAiCompatibleModelClient,
-    LocalToolRuntime, LocalToolConfig, YoloApproval,
+    LocalToolRuntime, LocalToolConfig, ModelCatalog, ModelRequestConfig, ReasoningConfig,
+    WireProtocol, YoloApproval,
 };
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -42,14 +43,23 @@ let tools = LocalToolRuntime::new(LocalToolConfig {
     emit: Arc::new(|_| {}),
 });
 
+let resolved_model = ModelCatalog::initialize().await?.resolve(
+    ModelRequestConfig {
+        model: "gpt-5.5".into(),
+        max_output_tokens: 4096,
+        temperature: None,
+        reasoning: ReasoningConfig::default(),
+    },
+    WireProtocol::OpenAiCompatible,
+).await?;
+
 let model = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
     // Full API prefix INCLUDING the version segment. The client appends only
     // `/chat/completions`. For other OpenAI-compatible providers use their own
     // prefix, e.g. GLM: "https://open.bigmodel.cn/api/paas/v4".
     base_url: "https://api.openai.com/v1".into(),
     api_key: std::env::var("OPENAI_API_KEY").unwrap(),
-    model: "gpt-4o".into(),
-    ..Default::default()
+    model: resolved_model,
 });
 
 let harness = AgentLoopHarness::new(model, tools);
@@ -76,18 +86,30 @@ unless the route is already present.
 
 ```rust
 use harness::{
-    AgentLoopHarness, NativeTurnInput, OpenAiResponsesConfig,
-    OpenAiResponsesModelClient,
+    AgentLoopHarness, ModelCatalog, ModelRequestConfig, NativeTurnInput,
+    OpenAiResponsesConfig, OpenAiResponsesModelClient, ReasoningConfig,
+    ReasoningMode, WireProtocol,
 };
 use std::path::PathBuf;
+
+let resolved_model = ModelCatalog::initialize().await?.resolve(
+    ModelRequestConfig {
+        model: "gpt-5.5".into(),
+        max_output_tokens: 4096,
+        temperature: None,
+        reasoning: ReasoningConfig {
+            mode: ReasoningMode::Enabled,
+            effort: Some("medium".into()),
+            budget_tokens: None,
+        },
+    },
+    WireProtocol::OpenAiResponses,
+).await?;
 
 let model = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
     base_url: OpenAiResponsesConfig::DEFAULT_BASE_URL.into(),
     api_key: std::env::var("OPENAI_API_KEY").unwrap(),
-    model: "gpt-5".into(),
-    temperature: None,
-    max_output_tokens: Some(4096),
-    reasoning_effort: Some("medium".into()),
+    model: resolved_model,
     reasoning_summary: Some("auto".into()),
 });
 
@@ -255,8 +277,7 @@ successful while delivering no answer and taking no action.
 ## Changelog
 
 Every behavior change should be recorded in `CHANGELOG.md` before release. This
-project uses patch-only version bumps within the current minor line, so the next
-release after `0.2.12` will be `0.2.13`.
+project uses patch-only version bumps within the current minor line.
 
 ### E2b sandbox
 
@@ -271,37 +292,35 @@ let tools = E2bToolRuntime::connect(E2bConfig::new(
 let harness = AgentLoopHarness::new(model, tools);
 ```
 
-## Model limits catalog
+## Model capabilities catalog
 
-Context-window and output-token limits are resolved per model from
-[`models.dev`](https://models.dev) (the public model registry opencode
-also uses), with a best-effort strategy that never blocks the agent loop:
+`models.dev["opencode"]` is the only source of model ids, token limits, and
+reasoning controls. The harness has no built-in profiles or fallback limits.
+Initialize the catalog explicitly at process startup, then resolve and freeze a
+model config for each session. Unknown, deprecated, ambiguous, or unsupported
+configurations fail before the first model request.
 
-1. **In-memory table** populated by a fire-and-forget background fetch.
-   On the first `resolve_limits()` call a fetch is spawned; while it is
-   in flight (typically during early LLM warm-up) callers get the
-   fallback value, and pick up the real value on the next turn.
-2. **Disk cache** at `<cache_dir>/agent-harness-rs/models.json` (5 min
-   TTL, atomic tempfile + `rename` write) so a network blip mid-session
-   still serves real values.
-3. **Offline fallback table** — the legacy hand-encoded claude/gpt/
-   o-series/minimax/deepseek mappings, so behavior never regresses.
-4. **Conservative default** `{ context: 128_000, output: 8_192 }`.
-
-The fetch retries 3× with exponential backoff (+ jitter) and a 10 s
-per-request timeout; on final failure it logs and falls back silently.
+The raw API JSON is cached at
+`<cache_dir>/agent-harness-rs/models.dev.json` for five minutes. A fresh cache
+starts immediately; a stale valid cache remains usable while one refresh runs;
+with no usable cache, initialization waits for models.dev and returns its error.
 
 ```rust
-use harness::{resolve_limits, prefetch_model_limits};
+use harness::{ModelCatalog, ModelRequestConfig, ReasoningConfig, WireProtocol};
 
-// Optional: warm the cache before the first turn. Safe to skip — the
-// first resolve_limits() triggers it lazily.
-prefetch_model_limits();
+let catalog = ModelCatalog::initialize().await?;
+let model = catalog.resolve(
+    ModelRequestConfig {
+        model: "deepseek-v4-pro".into(),
+        max_output_tokens: 65_536,
+        temperature: None,
+        reasoning: ReasoningConfig::default(),
+    },
+    WireProtocol::OpenAiCompatible,
+).await?;
 
-// Fast, non-async, never blocks.
-let limits = resolve_limits("claude-opus-4-7");
-// limits.context  — used for compaction thresholds
-// limits.output   — model's per-completion output cap
+// model.capabilities.limits.context drives compaction.
+// model.max_output_tokens is sent on every request.
 ```
 
 Configuration via environment variables:
@@ -309,7 +328,7 @@ Configuration via environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `AGENT_HARNESS_MODELS_URL` | `https://models.dev/api.json` | Override the registry endpoint |
-| `AGENT_HARNESS_CACHE_PATH` | `<cache_dir>/agent-harness-rs/models.json` | Relocate the disk cache |
+| `AGENT_HARNESS_MODELS_CACHE_PATH` | `<cache_dir>/agent-harness-rs/models.dev.json` | Relocate the disk cache |
 
 ## Approval modes
 

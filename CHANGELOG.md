@@ -4,6 +4,25 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.13] - 2026-08-17
+
+### Added
+
+- Added `ModelCatalog`, using only `models.dev["opencode"]` as the model
+  capability source, with explicit initialization and raw JSON disk caching.
+- Added strict short-id resolution, unique-basename resolution, and validation
+  for output limits, temperature, reasoning mode, effort, and token budgets.
+- Added shared `ModelRequestConfig` and `ResolvedModelConfig` types plus the
+  three supported `WireProtocol` values.
+
+### Changed
+
+- Model clients now consume a session-frozen `ResolvedModelConfig` and map its
+  reasoning controls to their protocol without model-name branches.
+- Removed lazy model-limit fetching, provider overrides, hand-written model
+  profiles, fuzzy auto-selection, fallback token limits, and optional output
+  budgets.
+
 ## [0.2.12] - 2026-08-13
 
 ### Added

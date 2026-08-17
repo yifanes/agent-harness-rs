@@ -17,8 +17,9 @@
 use std::collections::HashMap;
 
 use harness::{
-    AssistantThinking, ChatMessage, ModelChunk, ModelClient, ModelClientError, ModelTurnInput,
-    OpenAiResponsesConfig, OpenAiResponsesModelClient, ToolChoice, ToolInvocation, ToolSpec,
+    AssistantThinking, ChatMessage, ModelCatalog, ModelChunk, ModelClient, ModelClientError,
+    ModelRequestConfig, ModelTurnInput, OpenAiResponsesConfig, OpenAiResponsesModelClient,
+    ReasoningConfig, ReasoningMode, ToolChoice, ToolInvocation, ToolSpec, WireProtocol,
 };
 use serde_json::json;
 use tokio_stream::StreamExt;
@@ -207,13 +208,29 @@ async fn main() {
 
     println!("== config == base_url={base_url} model={model} effort={effort}\n");
 
+    let model = ModelCatalog::initialize()
+        .await
+        .expect("initialize models.dev catalog")
+        .resolve(
+            ModelRequestConfig {
+                model,
+                max_output_tokens: 4_096,
+                temperature: None,
+                reasoning: ReasoningConfig {
+                    mode: ReasoningMode::Enabled,
+                    effort: Some(effort),
+                    budget_tokens: None,
+                },
+            },
+            WireProtocol::OpenAiResponses,
+        )
+        .await
+        .expect("resolve model capabilities");
+
     let client = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
         base_url,
         api_key: key,
         model,
-        temperature: None,
-        max_output_tokens: Some(4096),
-        reasoning_effort: Some(effort),
         reasoning_summary: Some("auto".into()),
     });
     let ctx = Ctx {

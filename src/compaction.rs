@@ -189,18 +189,6 @@ pub fn estimate_context_tokens_anchored(messages: &[ChatMessage]) -> u64 {
     }
 }
 
-/// Per-model context window in tokens. Delegates to
-/// [`crate::model_limits::resolve_limits`] — see that module for the
-/// full resolution chain (models.dev fetch + disk cache + fallback
-/// table + conservative default).
-///
-/// Kept as a thin shim for backwards compatibility; new code should
-/// call [`crate::model_limits::resolve_limits`] to also get the model's
-/// output-token cap.
-pub fn resolve_context_window_tokens(model: &str) -> u64 {
-    crate::model_limits::resolve_context_window_tokens(model)
-}
-
 /// Context passed to [`CompactionStrategy::compact`].
 ///
 /// The policy receives the same system prompt, model client, resolved context
@@ -801,23 +789,6 @@ mod tests {
             estimate_context_tokens_anchored(&msgs),
             estimate_messages_tokens(&msgs)
         );
-    }
-
-    #[test]
-    fn context_window_table_known_models() {
-        assert_eq!(resolve_context_window_tokens("claude-opus-4-7"), 1_000_000);
-        assert_eq!(
-            resolve_context_window_tokens("claude-sonnet-4-6"),
-            1_000_000
-        );
-        assert_eq!(resolve_context_window_tokens("claude-haiku-4-5"), 200_000);
-        assert_eq!(resolve_context_window_tokens("claude-3-5-sonnet"), 200_000);
-        assert_eq!(resolve_context_window_tokens("gpt-4o"), 128_000);
-        assert_eq!(resolve_context_window_tokens("gpt-4.1-mini"), 128_000);
-        assert_eq!(resolve_context_window_tokens("o3-mini"), 200_000);
-        assert_eq!(resolve_context_window_tokens("MiniMax-M2"), 1_000_000);
-        // Unknown → conservative default.
-        assert_eq!(resolve_context_window_tokens("unknown-model"), 128_000);
     }
 
     #[test]

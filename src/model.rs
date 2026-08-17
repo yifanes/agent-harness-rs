@@ -4,6 +4,7 @@ use futures::stream::{BoxStream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::event::HarnessUsage;
+use crate::model_catalog::{ReasoningMode, ResolvedModelConfig, WireProtocol};
 use crate::tools::{ToolInvocation, ToolSpec};
 
 /// One token-level event from the model. The harness loop consumes a
@@ -473,12 +474,7 @@ fn tool_invocation_args_for_wire(tc: &ToolInvocation) -> String {
 pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub api_key: String,
-    pub model: String,
-    pub temperature: Option<f64>,
-    pub max_tokens: Option<i32>,
-    /// Reasoning effort hint: `"low"`, `"medium"`, or `"high"`. Sent as the
-    /// top-level `reasoning_effort` field. `None` omits it (provider default).
-    pub reasoning_effort: Option<String>,
+    pub model: ResolvedModelConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +485,11 @@ pub struct OpenAiCompatibleModelClient {
 
 impl OpenAiCompatibleModelClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Self {
+        assert_eq!(
+            config.model.wire_protocol,
+            WireProtocol::OpenAiCompatible,
+            "resolved model protocol must match OpenAiCompatibleModelClient"
+        );
         // Fail fast if the TCP handshake takes too long. Do not set a
         // read_timeout: streaming model responses may legitimately pause
         // longer than a fixed per-read timeout between SSE frames.
@@ -523,7 +524,7 @@ impl OpenAiCompatibleModelClient {
         }
 
         let mut body = json!({
-            "model": self.config.model,
+            "model": self.config.model.model,
             "messages": messages,
         });
         // Tool advertising obeys `tool_choice`:
@@ -545,22 +546,34 @@ impl OpenAiCompatibleModelClient {
                 body["parallel_tool_calls"] = json!(parallel);
             }
         }
-        if let Some(temperature) = self.config.temperature {
+        if let Some(temperature) = self.config.model.temperature {
             body["temperature"] = json!(temperature);
         }
-        if let Some(max_tokens) = self.config.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-        if let Some(effort) = self
-            .config
-            .reasoning_effort
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            body["reasoning_effort"] = json!(effort);
-        }
+        body["max_tokens"] = json!(self.config.model.max_output_tokens);
+        apply_openai_compatible_reasoning(&mut body, &self.config.model);
         body
     }
+}
+
+fn apply_openai_compatible_reasoning(body: &mut Value, model: &ResolvedModelConfig) {
+    if matches!(model.reasoning.mode, ReasoningMode::Default) {
+        return;
+    }
+    if let Some(effort) = model.reasoning.effort.as_deref() {
+        body["reasoning_effort"] = json!(effort);
+        return;
+    }
+    let mut thinking = json!({
+        "type": if matches!(model.reasoning.mode, ReasoningMode::Enabled) {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    });
+    if let Some(tokens) = model.reasoning.budget_tokens {
+        thinking["budget_tokens"] = json!(tokens);
+    }
+    body["thinking"] = thinking;
 }
 
 fn openai_tool_choice_value(c: &ToolChoice) -> Value {
@@ -1282,12 +1295,7 @@ fn scripted_chunks_for(input: &ModelTurnInput) -> Vec<ModelChunk> {
 pub struct AnthropicConfig {
     pub base_url: String,
     pub api_key: String,
-    pub model: String,
-    /// Required by Anthropic. Defaults to 4096 if the spec snapshot
-    /// doesn't override; we surface it on the config so HR can tune via
-    /// `spec_snapshot.agent_spec_version.model_config.max_tokens`.
-    pub max_tokens: i32,
-    pub temperature: Option<f64>,
+    pub model: ResolvedModelConfig,
     /// Wire-format version pin. Defaults to "2023-06-01" — the only one
     /// supported by Messages API at time of writing. Override if Anthropic
     /// ever publishes a newer one we want to opt into.
@@ -1298,10 +1306,6 @@ impl AnthropicConfig {
     /// Default `anthropic-version` header value the client sends if HR
     /// doesn't override it.
     pub const DEFAULT_VERSION: &'static str = "2023-06-01";
-    /// Default `max_tokens` when the agent recipe doesn't specify.
-    /// 4096 is small enough to keep cost-of-mistake bounded; HR is
-    /// expected to override on real workloads.
-    pub const DEFAULT_MAX_TOKENS: i32 = 4096;
 }
 
 #[derive(Debug, Clone)]
@@ -1312,6 +1316,11 @@ pub struct AnthropicModelClient {
 
 impl AnthropicModelClient {
     pub fn new(config: AnthropicConfig) -> Self {
+        assert_eq!(
+            config.model.wire_protocol,
+            WireProtocol::Anthropic,
+            "resolved model protocol must match AnthropicModelClient"
+        );
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
@@ -1358,8 +1367,8 @@ impl AnthropicModelClient {
         let cached = apply_anthropic_cache_strategy(system_field, tools, messages);
 
         let mut body = json!({
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
+            "model": self.config.model.model,
+            "max_tokens": self.config.model.max_output_tokens,
             "messages": cached.messages,
             "stream": true,
         });
@@ -1380,11 +1389,32 @@ impl AnthropicModelClient {
         // OpenAI-only knob. We silently ignore input.parallel_tool_calls
         // on this provider. (Anthropic returns multiple tool_use blocks
         // freely when the model decides to.)
-        if let Some(t) = self.config.temperature {
+        if let Some(t) = self.config.model.temperature {
             body["temperature"] = json!(t);
         }
+        apply_anthropic_reasoning(&mut body, &self.config.model);
         body
     }
+}
+
+fn apply_anthropic_reasoning(body: &mut Value, model: &ResolvedModelConfig) {
+    if matches!(model.reasoning.mode, ReasoningMode::Default) {
+        return;
+    }
+    if matches!(model.reasoning.mode, ReasoningMode::Disabled) {
+        body["thinking"] = json!({"type": "disabled"});
+        return;
+    }
+    if let Some(tokens) = model.reasoning.budget_tokens {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
+        return;
+    }
+    if let Some(effort) = model.reasoning.effort.as_deref() {
+        body["thinking"] = json!({"type": "adaptive"});
+        body["output_config"] = json!({"effort": effort});
+        return;
+    }
+    body["thinking"] = json!({"type": "enabled"});
 }
 
 fn anthropic_tool_choice_value(c: &ToolChoice) -> Value {
@@ -2086,12 +2116,7 @@ pub struct OpenAiResponsesConfig {
     /// `https://api.openai.com/v1`. The `/responses` route is appended.
     pub base_url: String,
     pub api_key: String,
-    pub model: String,
-    pub temperature: Option<f64>,
-    /// Responses' replacement for `max_tokens`. `None` ⇒ provider default.
-    pub max_output_tokens: Option<i32>,
-    /// `"low"` / `"medium"` / `"high"` → `reasoning.effort`. `None` omits it.
-    pub reasoning_effort: Option<String>,
+    pub model: ResolvedModelConfig,
     /// `"auto"` → `reasoning.summary`, which makes the model stream a
     /// human-readable summary of its reasoning (surfaced as thinking
     /// deltas). `None` omits it — the model still reasons, just silently.
@@ -2111,6 +2136,11 @@ pub struct OpenAiResponsesModelClient {
 
 impl OpenAiResponsesModelClient {
     pub fn new(config: OpenAiResponsesConfig) -> Self {
+        assert_eq!(
+            config.model.wire_protocol,
+            WireProtocol::OpenAiResponses,
+            "resolved model protocol must match OpenAiResponsesModelClient"
+        );
         // Same construction as the other clients: fail fast on a slow TCP
         // handshake, but never cap per-read time — streaming reasoning
         // responses legitimately pause between SSE frames.
@@ -2133,7 +2163,7 @@ impl OpenAiResponsesModelClient {
 
     fn request_body(&self, input: &ModelTurnInput) -> Value {
         let mut body = json!({
-            "model": self.config.model,
+            "model": self.config.model.model,
             "input": chat_messages_to_responses_input(&input.messages),
             "stream": true,
             // Always stateless — see `OpenAiResponsesConfig`. The harness
@@ -2182,16 +2212,16 @@ impl OpenAiResponsesModelClient {
             }
         }
 
-        if let Some(temperature) = self.config.temperature {
+        if let Some(temperature) = self.config.model.temperature {
             body["temperature"] = json!(temperature);
         }
-        if let Some(max_output) = self.config.max_output_tokens {
-            body["max_output_tokens"] = json!(max_output);
-        }
+        body["max_output_tokens"] = json!(self.config.model.max_output_tokens);
 
         let effort = self
             .config
-            .reasoning_effort
+            .model
+            .reasoning
+            .effort
             .as_deref()
             .filter(|s| !s.is_empty());
         let summary = self
@@ -2852,6 +2882,46 @@ impl OpenAiResponsesStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_catalog::{ModelCapabilities, ModelLimits, ReasoningConfig, ReasoningOption};
+
+    fn resolved_model(
+        id: &str,
+        protocol: WireProtocol,
+        max_output_tokens: u64,
+        temperature: Option<f64>,
+        reasoning: ReasoningConfig,
+    ) -> ResolvedModelConfig {
+        ResolvedModelConfig {
+            model: id.into(),
+            wire_protocol: protocol,
+            max_output_tokens,
+            temperature,
+            reasoning,
+            capabilities: ModelCapabilities {
+                id: id.into(),
+                limits: ModelLimits {
+                    context: 1_000_000,
+                    input: None,
+                    output: 384_000,
+                },
+                reasoning: true,
+                reasoning_options: vec![
+                    ReasoningOption::Toggle,
+                    ReasoningOption::Effort {
+                        values: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
+                    },
+                ],
+                temperature: true,
+                tool_call: true,
+                interleaved: None,
+                status: None,
+            },
+        }
+    }
+
+    fn default_model(id: &str, protocol: WireProtocol) -> ResolvedModelConfig {
+        resolved_model(id, protocol, 2_048, None, ReasoningConfig::default())
+    }
 
     fn user(prompt: &str) -> ModelTurnInput {
         ModelTurnInput {
@@ -2887,10 +2957,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test/v1/".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         assert_eq!(
             client.endpoint(),
@@ -2899,10 +2966,7 @@ mod tests {
         let client_with_v1 = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         assert_eq!(
             client_with_v1.endpoint(),
@@ -2913,10 +2977,7 @@ mod tests {
         let glm = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
             api_key: "sk-test".into(),
-            model: "glm-4.6".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("glm-4.6", WireProtocol::OpenAiCompatible),
         });
         assert_eq!(
             glm.endpoint(),
@@ -2959,10 +3020,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         let body = client.request_body(&ModelTurnInput {
             system_prompt: None,
@@ -2984,10 +3042,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         let body = client.request_body(&ModelTurnInput {
             system_prompt: None,
@@ -3012,10 +3067,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         let body = client.request_body(&ModelTurnInput {
             system_prompt: None,
@@ -3037,10 +3089,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         let err = match client
             .stream(ModelTurnInput {
@@ -3086,10 +3135,7 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         let input = ModelTurnInput {
             system_prompt: Some("you are concise".into()),
@@ -3793,9 +3839,13 @@ mod tests {
         AnthropicModelClient::new(AnthropicConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "claude-test".into(),
-            max_tokens: 1024,
-            temperature: None,
+            model: resolved_model(
+                "claude-test",
+                WireProtocol::Anthropic,
+                1_024,
+                None,
+                ReasoningConfig::default(),
+            ),
             anthropic_version: AnthropicConfig::DEFAULT_VERSION.into(),
         })
     }
@@ -3871,10 +3921,7 @@ mod tests {
         let chat = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiCompatible),
         });
         assert_eq!(
             chat.hosted_capability(HostedCapability::WebSearch),
@@ -3884,10 +3931,7 @@ mod tests {
         let responses = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_output_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiResponses),
             reasoning_summary: None,
         });
         assert_eq!(
@@ -3898,10 +3942,7 @@ mod tests {
         let gateway = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
             base_url: "https://gateway.example/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: None,
-            max_output_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-test", WireProtocol::OpenAiResponses),
             reasoning_summary: None,
         });
         assert_eq!(
@@ -4254,10 +4295,13 @@ mod tests {
         let client = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
             base_url: "https://example.test".into(),
             api_key: "sk-test".into(),
-            model: "gpt-test".into(),
-            temperature: Some(0.2),
-            max_tokens: Some(128),
-            reasoning_effort: None,
+            model: resolved_model(
+                "gpt-test",
+                WireProtocol::OpenAiCompatible,
+                128,
+                Some(0.2),
+                ReasoningConfig::default(),
+            ),
         });
         let body = client.request_body(&ModelTurnInput {
             system_prompt: None,
@@ -4300,6 +4344,66 @@ mod tests {
         );
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn reasoning_controls_translate_by_wire_protocol() {
+        let openai = OpenAiCompatibleModelClient::new(OpenAiCompatibleConfig {
+            base_url: "https://example.test".into(),
+            api_key: "test".into(),
+            model: resolved_model(
+                "deepseek-v4-pro",
+                WireProtocol::OpenAiCompatible,
+                4_096,
+                None,
+                ReasoningConfig {
+                    mode: ReasoningMode::Enabled,
+                    effort: None,
+                    budget_tokens: None,
+                },
+            ),
+        });
+        let body = openai.request_body(&user("hi"));
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        let anthropic = AnthropicModelClient::new(AnthropicConfig {
+            base_url: "https://example.test/v1".into(),
+            api_key: "test".into(),
+            model: resolved_model(
+                "claude-sonnet-4-6",
+                WireProtocol::Anthropic,
+                4_096,
+                None,
+                ReasoningConfig {
+                    mode: ReasoningMode::Enabled,
+                    effort: Some("high".into()),
+                    budget_tokens: None,
+                },
+            ),
+            anthropic_version: AnthropicConfig::DEFAULT_VERSION.into(),
+        });
+        let body = anthropic.request_body(&user("hi"));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        let responses = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
+            base_url: "https://example.test/v1".into(),
+            api_key: "test".into(),
+            model: resolved_model(
+                "gpt-5.5",
+                WireProtocol::OpenAiResponses,
+                4_096,
+                None,
+                ReasoningConfig {
+                    mode: ReasoningMode::Disabled,
+                    effort: Some("none".into()),
+                    budget_tokens: None,
+                },
+            ),
+            reasoning_summary: None,
+        });
+        let body = responses.request_body(&user("hi"));
+        assert_eq!(body["reasoning"]["effort"], "none");
     }
 
     #[tokio::test]
@@ -4356,10 +4460,17 @@ mod tests {
             OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
                 base_url: base.into(),
                 api_key: "sk-test".into(),
-                model: "gpt-5".into(),
-                temperature: None,
-                max_output_tokens: Some(2048),
-                reasoning_effort: Some("high".into()),
+                model: resolved_model(
+                    "gpt-5",
+                    WireProtocol::OpenAiResponses,
+                    2_048,
+                    None,
+                    ReasoningConfig {
+                        mode: ReasoningMode::Enabled,
+                        effort: Some("high".into()),
+                        budget_tokens: None,
+                    },
+                ),
                 reasoning_summary: None,
             })
         };
@@ -4406,10 +4517,7 @@ mod tests {
         let client = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-5".into(),
-            temperature: None,
-            max_output_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-5", WireProtocol::OpenAiResponses),
             reasoning_summary: None,
         });
         let mut input = user("hi");
@@ -4441,10 +4549,7 @@ mod tests {
         let client = OpenAiResponsesModelClient::new(OpenAiResponsesConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: "sk-test".into(),
-            model: "gpt-5".into(),
-            temperature: None,
-            max_output_tokens: None,
-            reasoning_effort: None,
+            model: default_model("gpt-5", WireProtocol::OpenAiResponses),
             reasoning_summary: None,
         });
         // Hosted tool only — no client function tools.
