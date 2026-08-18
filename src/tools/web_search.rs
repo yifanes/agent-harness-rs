@@ -405,6 +405,184 @@ impl WebSearchProvider for BraveSearchProvider {
     }
 }
 
+#[derive(Clone)]
+pub struct ExaSearchConfig {
+    pub api_key: String,
+    /// API prefix, e.g. `https://api.exa.ai`. The `/search` route is appended.
+    pub base_url: String,
+    pub timeout: Duration,
+}
+
+impl ExaSearchConfig {
+    pub const DEFAULT_BASE_URL: &'static str = "https://api.exa.ai";
+
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: Self::DEFAULT_BASE_URL.into(),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+/// Exa (`https://exa.ai`) managed-search adapter. Exa returns extract
+/// `highlights` per result, which make better snippets than the raw page
+/// `text`, so we request those and fall back to truncated text.
+#[derive(Clone)]
+pub struct ExaSearchProvider {
+    http: reqwest::Client,
+    config: ExaSearchConfig,
+}
+
+impl ExaSearchProvider {
+    pub fn new(config: ExaSearchConfig) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { http, config }
+    }
+}
+
+#[derive(Deserialize)]
+struct ExaResponse {
+    #[serde(default)]
+    results: Vec<ExaResult>,
+}
+
+#[derive(Deserialize)]
+struct ExaResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "publishedDate")]
+    published_date: Option<String>,
+    #[serde(default)]
+    highlights: Vec<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// Snippet source preference: joined highlights, else truncated page text.
+/// The runtime still applies `MAX_SNIPPET_CHARS` on top, so the fallback cap
+/// here only needs to keep pathological pages from dominating the body cap.
+const MAX_EXA_TEXT_FALLBACK_CHARS: usize = 1_000;
+
+fn parse_exa_response(body: &[u8]) -> Result<Vec<WebSearchResult>, WebSearchProviderError> {
+    let payload = serde_json::from_slice::<ExaResponse>(body)
+        .map_err(|error| WebSearchProviderError::InvalidResponse(error.to_string()))?;
+    Ok(payload
+        .results
+        .into_iter()
+        .map(|result| {
+            let snippet = if result.highlights.is_empty() {
+                result
+                    .text
+                    .map(|text| text.chars().take(MAX_EXA_TEXT_FALLBACK_CHARS).collect())
+                    .unwrap_or_default()
+            } else {
+                result.highlights.join("\n")
+            };
+            WebSearchResult {
+                title: result.title,
+                url: result.url,
+                snippet,
+                published_at: result.published_date,
+            }
+        })
+        .collect())
+}
+
+#[async_trait]
+impl WebSearchProvider for ExaSearchProvider {
+    fn id(&self) -> &str {
+        "exa"
+    }
+
+    async fn search(
+        &self,
+        request: WebSearchRequest,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<WebSearchResult>, WebSearchProviderError> {
+        if self.config.api_key.trim().is_empty() {
+            return Err(WebSearchProviderError::Auth(
+                "Exa API key is empty".into(),
+            ));
+        }
+        let send = self
+            .http
+            .post(format!("{}/search", self.config.base_url))
+            .header("x-api-key", &self.config.api_key)
+            .json(&json!({
+                "query": request.query,
+                "numResults": request.count,
+                "contents": {
+                    "highlights": { "numSentences": 2, "highlightsPerUrl": 1 }
+                }
+            }))
+            .timeout(self.config.timeout)
+            .send();
+        let response = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(WebSearchProviderError::Cancelled),
+                response = send => response,
+            }
+        } else {
+            send.await
+        }
+        .map_err(|error| {
+            if error.is_timeout() {
+                WebSearchProviderError::Timeout(error.to_string())
+            } else {
+                WebSearchProviderError::Request(error.to_string())
+            }
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WebSearchProviderError::Auth(format!(
+                "Exa returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        // Quota exhaustion (402/429) and every other non-2xx degrade to a
+        // tool-visible failure — the model is told search is unavailable and
+        // the turn keeps going.
+        if !status.is_success() {
+            return Err(WebSearchProviderError::Request(format!(
+                "Exa returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        loop {
+            let next = if let Some(cancel) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(WebSearchProviderError::Cancelled),
+                    next = stream.next() => next,
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk =
+                chunk.map_err(|error| WebSearchProviderError::Request(error.to_string()))?;
+            if body.len() + chunk.len() > MAX_PROVIDER_RESPONSE_BYTES {
+                return Err(WebSearchProviderError::InvalidResponse(format!(
+                    "response exceeded {MAX_PROVIDER_RESPONSE_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        parse_exa_response(&body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +657,80 @@ mod tests {
                 .unwrap_err();
             assert_eq!(failure.kind, ToolFailureKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn exa_parse_prefers_highlights_over_text() {
+        let body = json!({
+            "results": [{
+                "title": "Rust 1.90",
+                "url": "https://blog.rust-lang.org/1.90",
+                "publishedDate": "2025-09-18T00:00:00.000Z",
+                "highlights": ["first highlight", "second highlight"],
+                "text": "full page text that should not be used"
+            }]
+        })
+        .to_string();
+        let results = parse_exa_response(body.as_bytes()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust 1.90");
+        assert_eq!(results[0].snippet, "first highlight\nsecond highlight");
+        assert_eq!(
+            results[0].published_at.as_deref(),
+            Some("2025-09-18T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn exa_parse_falls_back_to_truncated_text() {
+        let long_text = "x".repeat(MAX_EXA_TEXT_FALLBACK_CHARS + 100);
+        let body = json!({
+            "results": [{
+                "title": "No highlights",
+                "url": "https://example.com/a",
+                "text": long_text
+            }, {
+                "url": "https://example.com/b"
+            }]
+        })
+        .to_string();
+        let results = parse_exa_response(body.as_bytes()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].snippet.chars().count(),
+            MAX_EXA_TEXT_FALLBACK_CHARS
+        );
+        // Missing title/highlights/text all default to empty — the runtime's
+        // normalize_result drops results with neither title nor snippet.
+        assert_eq!(results[1].title, "");
+        assert_eq!(results[1].snippet, "");
+        assert_eq!(results[1].published_at, None);
+    }
+
+    #[test]
+    fn exa_parse_handles_empty_results_and_rejects_garbage() {
+        let results = parse_exa_response(br#"{"results": []}"#).unwrap();
+        assert!(results.is_empty());
+        // Missing `results` key defaults to empty rather than erroring.
+        let results = parse_exa_response(br#"{"requestId": "abc"}"#).unwrap();
+        assert!(results.is_empty());
+        let error = parse_exa_response(b"not json").unwrap_err();
+        assert!(matches!(error, WebSearchProviderError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn exa_empty_api_key_fails_closed_without_request() {
+        let provider = ExaSearchProvider::new(ExaSearchConfig::new("  "));
+        let error = provider
+            .search(
+                WebSearchRequest {
+                    query: "rust".into(),
+                    count: 5,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WebSearchProviderError::Auth(_)));
     }
 }
