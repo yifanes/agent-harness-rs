@@ -15,6 +15,14 @@ line.
   going. Exported from the crate root alongside the Brave adapter.
 - Added `examples/exa_search_smoke.rs`, a live smoke harness covering the full
   managed-tool path plus the bad-key degradation path.
+- Added `ModelCatalog::capabilities`, a lookup-only view of one model's
+  capabilities so callers can clamp `max_output_tokens` or drop unsupported
+  temperature / reasoning knobs before `resolve` instead of recovering from
+  `InvalidRequest` errors after the fact.
+- Added `ModelCatalog::from_json`, building a catalog from a models.dev-shaped
+  payload with no network fetch or disk cache — for tests, air-gapped
+  deployments, and custom gateways whose model ids are absent from
+  models.dev["opencode"].
 
 ## [0.2.13] - 2026-08-17
 

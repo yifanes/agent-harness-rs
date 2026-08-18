@@ -293,13 +293,7 @@ impl ModelCatalog {
         request: ModelRequestConfig,
         wire_protocol: WireProtocol,
     ) -> Result<ResolvedModelConfig, ModelCatalogError> {
-        let snapshot = self.snapshot.read().await;
-        let requested = request.model.trim().to_ascii_lowercase();
-        let capabilities = match snapshot.models.get(&requested) {
-            Some(model) => model.clone(),
-            None => resolve_unique_basename(&snapshot.models, &requested)?,
-        };
-        drop(snapshot);
+        let capabilities = self.capabilities(&request.model).await?;
         validate_request(&request, &capabilities, wire_protocol)?;
         Ok(ResolvedModelConfig {
             model: capabilities.id.clone(),
@@ -308,6 +302,36 @@ impl ModelCatalog {
             temperature: request.temperature,
             reasoning: normalize_reasoning(request.reasoning, &capabilities),
             capabilities,
+        })
+    }
+
+    /// Look up one model's capabilities without validating a request. Lets
+    /// callers clamp `max_output_tokens` or drop unsupported temperature /
+    /// reasoning knobs *before* [`Self::resolve`], instead of recovering
+    /// from `InvalidRequest` errors after the fact.
+    pub async fn capabilities(
+        &self,
+        model: &str,
+    ) -> Result<ModelCapabilities, ModelCatalogError> {
+        let snapshot = self.snapshot.read().await;
+        let requested = model.trim().to_ascii_lowercase();
+        match snapshot.models.get(&requested) {
+            Some(model) => Ok(model.clone()),
+            None => resolve_unique_basename(&snapshot.models, &requested),
+        }
+    }
+
+    /// Build a catalog from a models.dev-shaped JSON payload — no network
+    /// fetch, no disk cache. For embedding a fixed catalog: tests,
+    /// air-gapped deployments, and custom gateways whose model ids are
+    /// absent from models.dev["opencode"].
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ModelCatalogError> {
+        Ok(Self {
+            snapshot: Arc::new(RwLock::new(parse_snapshot(bytes)?)),
+            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_generation: Arc::new(AtomicU64::new(0)),
+            cache_path: None,
+            models_url: String::new(),
         })
     }
 
@@ -631,13 +655,7 @@ mod tests {
     }
 
     fn catalog(json: &str) -> ModelCatalog {
-        ModelCatalog {
-            snapshot: Arc::new(RwLock::new(parse_snapshot(json.as_bytes()).unwrap())),
-            refresh_lock: Arc::new(Mutex::new(())),
-            refresh_generation: Arc::new(AtomicU64::new(0)),
-            cache_path: None,
-            models_url: "unused".into(),
-        }
+        ModelCatalog::from_json(json.as_bytes()).unwrap()
     }
 
     const FIXTURE: &str = r#"{
@@ -698,6 +716,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ModelCatalogError::ModelNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn capabilities_looks_up_without_request_validation() {
+        let source = catalog(FIXTURE);
+        let caps = source.capabilities("gpt-5.5").await.unwrap();
+        assert_eq!(caps.limits.output, 128_000);
+        assert!(!caps.temperature);
+        // Deprecated models still resolve at the lookup layer — deprecation
+        // is a request-validation concern, not a lookup one.
+        let caps = source.capabilities("old-model").await.unwrap();
+        assert_eq!(caps.status.as_deref(), Some("deprecated"));
+        assert!(matches!(
+            source.capabilities("missing-model").await.unwrap_err(),
+            ModelCatalogError::ModelNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn from_json_rejects_payloads_without_the_trusted_provider() {
+        let error = ModelCatalog::from_json(br#"{"other": {"models": {}}}"#).unwrap_err();
+        assert!(matches!(error, ModelCatalogError::ProviderMissing));
+        let error = ModelCatalog::from_json(b"garbage").unwrap_err();
+        assert!(matches!(error, ModelCatalogError::Decode(_)));
     }
 
     #[tokio::test]
