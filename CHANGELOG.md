@@ -4,6 +4,18 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.14] - 2026-08-18
+
+### Added
+
+- Added `ExaSearchProvider` / `ExaSearchConfig`, a managed web-search adapter
+  for Exa (`https://exa.ai`). Snippets prefer Exa's extract `highlights` and
+  fall back to truncated page text; quota exhaustion (402/429) and all other
+  non-2xx responses degrade to tool-visible failures so the agent turn keeps
+  going. Exported from the crate root alongside the Brave adapter.
+- Added `examples/exa_search_smoke.rs`, a live smoke harness covering the full
+  managed-tool path plus the bad-key degradation path.
+
 ## [0.2.13] - 2026-08-17
 
 ### Added

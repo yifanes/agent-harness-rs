@@ -47,8 +47,9 @@ pub use skills::{
     SkillPromptRenderer, SkillSource, SkillsManager,
 };
 pub use tools::web_search::{
-    web_search_spec, BraveSearchConfig, BraveSearchProvider, WebSearchProvider,
-    WebSearchProviderError, WebSearchRequest, WebSearchResult, WebSearchToolRuntime,
+    web_search_spec, BraveSearchConfig, BraveSearchProvider, ExaSearchConfig, ExaSearchProvider,
+    WebSearchProvider, WebSearchProviderError, WebSearchRequest, WebSearchResult,
+    WebSearchToolRuntime,
 };
 pub use tools::{
     builtin_tool_specs, fs_glob, fs_glob_bounded, resolve_edit_search, simple_glob_match,
