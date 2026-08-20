@@ -73,7 +73,7 @@ pub struct ModelLimits {
     pub output: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningOption {
     Toggle,
@@ -86,6 +86,82 @@ pub enum ReasoningOption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<u64>,
     },
+}
+
+impl ReasoningOption {
+    /// Lenient decode of one `reasoning_options` entry.
+    ///
+    /// The live models.dev payload carries data-quality defects that must not
+    /// poison the catalog (see the crate-level tolerance contract):
+    ///
+    /// * `budget_tokens.min`/`max` may be negative, which upstream uses to
+    ///   mean "no bound" — decoded as `None`.
+    /// * `effort.values` may contain `null` or non-string entries — dropped.
+    ///
+    /// Anything structurally wrong (missing `type`, non-array `values`, a
+    /// bound that is neither null nor an integer) is an error so the
+    /// *containing model* is skipped by [`parse_snapshot`] instead of failing
+    /// the whole payload.
+    fn from_value(value: &Value) -> Result<Self, String> {
+        let type_ = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "reasoning option is missing `type`".to_owned())?;
+        match type_ {
+            "toggle" => Ok(Self::Toggle),
+            "effort" => {
+                let raw = value
+                    .get("values")
+                    .ok_or_else(|| "effort option is missing `values`".to_owned())?;
+                let entries = raw
+                    .as_array()
+                    .ok_or_else(|| "effort option `values` is not an array".to_owned())?;
+                let values = entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                Ok(Self::Effort { values })
+            }
+            "budget_tokens" => {
+                let malformed = |value: &Value, key: &str| -> bool {
+                    matches!(
+                        value.get(key),
+                        Some(v) if !v.is_null() && v.as_i64().is_none() && v.as_u64().is_none()
+                    )
+                };
+                if malformed(value, "min") || malformed(value, "max") {
+                    return Err("budget_tokens bounds must be integers".into());
+                }
+                let bound = |value: &Value, key: &str| -> Option<u64> {
+                    match value.get(key) {
+                        None | Some(Value::Null) => None,
+                        Some(v) => match v.as_i64() {
+                            Some(n) if n >= 0 => Some(n as u64),
+                            // Negative = "no bound" in upstream data.
+                            Some(_) => None,
+                            None => v.as_u64(),
+                        },
+                    }
+                };
+                Ok(Self::BudgetTokens {
+                    min: bound(value, "min"),
+                    max: bound(value, "max"),
+                })
+            }
+            other => Err(format!("unknown reasoning option type `{other}`")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningOption {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_value(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,13 +226,8 @@ pub enum ModelCatalogError {
     InvalidRequest { model: String, message: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CatalogRoot(HashMap<String, ProviderEntry>);
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProviderEntry {
-    models: HashMap<String, ModelEntry>,
-}
+// The root payload is parsed as a `Value` in [`parse_snapshot`] and only the
+// `{PROVIDER}` provider's `models` object is consumed, per-model.
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelEntry {
@@ -206,6 +277,11 @@ impl ModelEntry {
     }
 }
 
+/// Decoded, lower-cased model ids of the `{PROVIDER}` provider. Built by
+/// [`parse_snapshot`], which parses model entries individually: a single
+/// malformed entry is skipped (with a warn) instead of failing the whole
+/// payload, so one dirty model in any provider can never take the catalog
+/// down.
 #[derive(Debug, Clone)]
 struct CatalogSnapshot {
     models: HashMap<String, ModelCapabilities>,
@@ -341,22 +417,47 @@ impl ModelCatalog {
 }
 
 fn parse_snapshot(bytes: &[u8]) -> Result<CatalogSnapshot, ModelCatalogError> {
-    let root: CatalogRoot = serde_json::from_slice(bytes)
+    let root: Value = serde_json::from_slice(bytes)
         .map_err(|error| ModelCatalogError::Decode(error.to_string()))?;
+    let root = root
+        .as_object()
+        .ok_or_else(|| ModelCatalogError::Decode("payload root is not a JSON object".into()))?;
     let provider = root
-        .0
         .get(PROVIDER)
         .ok_or(ModelCatalogError::ProviderMissing)?;
     let models = provider
-        .models
-        .clone()
-        .into_iter()
-        .map(|(id, entry)| {
-            let key = id.to_ascii_lowercase();
-            (key, entry.into_capabilities(id))
-        })
-        .collect();
-    Ok(CatalogSnapshot { models })
+        .get("models")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ModelCatalogError::Decode(format!(
+                "{PROVIDER} provider is missing a usable `models` object"
+            ))
+        })?;
+    let mut parsed: HashMap<String, ModelCapabilities> = HashMap::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for (id, entry) in models {
+        match serde_json::from_value::<ModelEntry>(entry.clone()) {
+            Ok(entry) => {
+                parsed.insert(id.to_ascii_lowercase(), entry.into_capabilities(id.clone()));
+            }
+            Err(_) => skipped.push(id.clone()),
+        }
+    }
+    if parsed.is_empty() && !models.is_empty() {
+        return Err(ModelCatalogError::Decode(format!(
+            "no model in {PROVIDER} could be decoded ({} unusable entries)",
+            skipped.len()
+        )));
+    }
+    if !skipped.is_empty() {
+        let preview: Vec<String> = skipped.iter().take(5).cloned().collect();
+        warn!(
+            skipped = %skipped.len(),
+            first_skipped = %preview.join(", "),
+            "models.dev entries with unusable data were skipped"
+        );
+    }
+    Ok(CatalogSnapshot { models: parsed })
 }
 
 fn resolve_unique_basename(
@@ -816,6 +917,146 @@ mod tests {
                 .resolve(contradictory, WireProtocol::OpenAiResponses)
                 .await,
             Err(ModelCatalogError::InvalidRequest { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Lenient-decode contract: live models.dev data-quality defects must not
+    // poison the catalog. See the crate-level tolerance contract and
+    // `parse_snapshot` / `ReasoningOption::from_value`.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_payload_negative_budget_min_is_tolerated() {
+        // Reproduces the real `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`
+        // defect: `budget_tokens.min = -1` must decode as "no bound".
+        let json = r#"{
+          "opencode": {"models": {
+            "nemotron": {
+              "reasoning": true,
+              "reasoning_options": [
+                {"type":"budget_tokens","min":-1,"max":32768}
+              ],
+              "limit": {"context": 200000, "output": 32768}
+            }
+          }}
+        }"#;
+        let source = catalog(json);
+        let mut req = request("nemotron");
+        req.max_output_tokens = 1024;
+        let resolved = source
+            .resolve(req, WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        let option = resolved.capabilities.reasoning_options.first().unwrap();
+        match option {
+            ReasoningOption::BudgetTokens { min, max } => {
+                assert_eq!(*min, None);
+                assert_eq!(*max, Some(32_768));
+            }
+            other => panic!("expected budget_tokens, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_payload_null_effort_values_are_filtered() {
+        // Reproduces the real `sarvam-105b` / `sarvam-30b` defect:
+        // `effort.values = [null, "low", "medium"]` must drop the null.
+        let json = r#"{
+          "opencode": {"models": {
+            "sarvam-105b": {
+              "reasoning": true,
+              "reasoning_options": [
+                {"type":"effort","values":[null,"low","medium",123]}
+              ],
+              "limit": {"context": 4096, "output": 1024}
+            }
+          }}
+        }"#;
+        let source = catalog(json);
+        let mut req = request("sarvam-105b");
+        req.max_output_tokens = 1024;
+        let resolved = source
+            .resolve(req, WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        let option = resolved.capabilities.reasoning_options.first().unwrap();
+        assert_eq!(
+            option,
+            &ReasoningOption::Effort {
+                values: vec!["low".into(), "medium".into()]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unusable_entry_is_skipped_not_fatal() {
+        // A single structurally broken model (negative `context`, which is
+        // genuinely unusable) must be skipped while its siblings survive.
+        let json = r#"{
+          "opencode": {"models": {
+            "good-a": {
+              "limit": {"context": 1000, "output": 100},
+              "reasoning_options": []
+            },
+            "broken": {
+              "limit": {"context": -1, "output": 100}
+            },
+            "good-b": {
+              "limit": {"context": 2000, "output": 200}
+            }
+          }}
+        }"#;
+        let source = catalog(json);
+        // Both good models remain resolvable...
+        for name in ["good-a", "good-b"] {
+            let mut req = request(name);
+            req.max_output_tokens = 100;
+            source
+                .resolve(req, WireProtocol::OpenAiCompatible)
+                .await
+                .unwrap();
+        }
+        // ...and the broken one is a clean per-model miss, not a catalog failure.
+        let mut broken = request("broken");
+        broken.max_output_tokens = 100;
+        assert!(matches!(
+            source.resolve(broken, WireProtocol::OpenAiCompatible).await,
+            Err(ModelCatalogError::ModelNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn opencode_without_models_object_is_a_data_failure() {
+        // `opencode` present but structurally unusable: this IS a data failure
+        // and must fail closed (empty catalog would hide the defect).
+        let json = r#"{"opencode": {"name": "opencode"}, "other": {"models": {"x":{"limit":{"context":1,"output":1}}}}}"#;
+        assert!(matches!(
+            ModelCatalog::from_json(json.as_bytes()),
+            Err(ModelCatalogError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn missing_opencode_provider_still_missing() {
+        let json = r#"{"other": {"models": {"x":{"limit":{"context":1,"output":1}}}}}"#;
+        assert!(matches!(
+            ModelCatalog::from_json(json.as_bytes()),
+            Err(ModelCatalogError::ProviderMissing)
+        ));
+    }
+
+    #[test]
+    fn all_entries_unusable_is_a_data_failure() {
+        let json = r#"{
+          "opencode": {"models": {
+            "a": {"limit": {"context": -1, "output": 1}},
+            "b": {"limit": {"context": -2, "output": 2}}
+          }}
+        }"#;
+        assert!(matches!(
+            ModelCatalog::from_json(json.as_bytes()),
+            Err(ModelCatalogError::Decode(_))
         ));
     }
 }
