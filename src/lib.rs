@@ -33,9 +33,9 @@ pub use model::{
     OpenAiResponsesModelClient, ScriptedModelClient, ToolChoice, UserAttachment,
 };
 pub use model_catalog::{
-    InterleavedReasoning, ModelCapabilities, ModelCatalog, ModelCatalogError, ModelLimits,
-    ModelRequestConfig, ReasoningConfig, ReasoningMode, ReasoningOption, ResolvedModelConfig,
-    WireProtocol,
+    InterleavedReasoning, LimitsSource, ModelCapabilities, ModelCatalog, ModelCatalogError,
+    ModelLimits, ModelRequestConfig, ReasoningConfig, ReasoningMode, ReasoningOption,
+    ResolvedModelConfig, WireProtocol, DEFAULT_CONTEXT_LIMIT, DEFAULT_OUTPUT_LIMIT,
 };
 pub use runner::{FakeNativeHarness, NativeHarness, ToolCapableFakeHarness};
 pub use shell_risk::{

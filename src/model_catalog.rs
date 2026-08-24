@@ -2,8 +2,14 @@
 //!
 //! Hosts initialize the catalog explicitly during startup, resolve a short
 //! model id once, and keep the resulting [`ResolvedModelConfig`] for the
-//! lifetime of the session. There are deliberately no built-in model profiles,
-//! cross-provider merges, or fallback limits.
+//! lifetime of the session. There are deliberately no built-in model profiles
+//! or cross-provider merges. A model id absent from the catalog (renamed or
+//! gateway-local ids) resolves against the conservative built-in defaults and
+//! is marked [`LimitsSource::Default`] — callers must surface that marker
+//! instead of treating the limits as verified facts, and capability
+//! assertions (output cap, reasoning/temperature support, deprecation) are
+//! skipped for such models so a conservative guess can never veto a declared
+//! request; the provider stays the final authority.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -171,6 +177,41 @@ pub struct InterleavedReasoning {
     pub field: Option<String>,
 }
 
+/// Where a model's capabilities came from.
+///
+/// [`LimitsSource::Default`] marks the conservative fallback applied to model
+/// ids that are absent from the catalog. It is an observability signal, not a
+/// quality grade: limits under this marker are a guess and must be surfaced
+/// by the caller (log / status event), never treated as verified model facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitsSource {
+    /// Verified against the `models.dev["opencode"]` catalog.
+    #[default]
+    Catalog,
+    /// Conservative built-in defaults; the model id was not in the catalog.
+    Default,
+}
+
+impl std::fmt::Display for LimitsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LimitsSource::Catalog => f.write_str("catalog"),
+            LimitsSource::Default => f.write_str("default"),
+        }
+    }
+}
+
+/// Conservative context window for models absent from the catalog. Deliberately
+/// the low end of modern agent-model windows: an under-estimate compacts early
+/// (safe), an over-estimate overflows the real provider window mid-turn (the
+/// one direction that must never be guessed).
+pub const DEFAULT_CONTEXT_LIMIT: u64 = 128_000;
+/// Conservative output limit for models absent from the catalog; matches the
+/// bound RD's bootstrap layer applies to legacy sessions (safely below the
+/// tightest limit in the deployed legacy model set).
+pub const DEFAULT_OUTPUT_LIMIT: u64 = 32_768;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub id: String,
@@ -183,6 +224,8 @@ pub struct ModelCapabilities {
     pub interleaved: Option<InterleavedReasoning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(default)]
+    pub limits_source: LimitsSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,6 +259,9 @@ pub enum ModelCatalogError {
     Decode(String),
     #[error("models.dev has no `{PROVIDER}` provider")]
     ProviderMissing,
+    /// Retained for API stability. Since the fail-open default resolution,
+    /// `resolve` no longer produces this error: unknown ids resolve against
+    /// conservative defaults marked [`LimitsSource::Default`] instead.
     #[error("model `{model}` is not present in models.dev[{PROVIDER}]{suggestions}")]
     ModelNotFound { model: String, suggestions: String },
     #[error("model id `{model}` is ambiguous in models.dev[{PROVIDER}]: {matches:?}")]
@@ -273,7 +319,30 @@ impl ModelEntry {
             tool_call: self.tool_call,
             interleaved,
             status: self.status,
+            limits_source: LimitsSource::Catalog,
         }
+    }
+}
+
+/// Conservative capabilities for a model id that is absent from the catalog.
+/// The id is kept exactly as requested (only trimmed) — it is echoed back to
+/// the provider as the wire model name, and gateway-local ids may be
+/// case-sensitive, unlike the lower-cased catalog keys.
+fn default_capabilities(id: String) -> ModelCapabilities {
+    ModelCapabilities {
+        id,
+        limits: ModelLimits {
+            context: DEFAULT_CONTEXT_LIMIT,
+            input: None,
+            output: DEFAULT_OUTPUT_LIMIT,
+        },
+        reasoning: false,
+        reasoning_options: Vec::new(),
+        temperature: true,
+        tool_call: true,
+        interleaved: None,
+        status: None,
+        limits_source: LimitsSource::Default,
     }
 }
 
@@ -363,7 +432,11 @@ impl ModelCatalog {
 
     /// Resolve and validate a short model id for one of the three wire
     /// protocols. Exact id match wins; a path-like id may also match by a
-    /// unique basename. Contains/fuzzy matches are suggestions only.
+    /// unique basename. Contains/fuzzy matches are suggestions only. An id
+    /// with no match at all does not error: it resolves against
+    /// [`default_capabilities`]-style conservative limits marked
+    /// [`LimitsSource::Default`] (see the module docs for the validation
+    /// split that follows from that).
     pub async fn resolve(
         &self,
         request: ModelRequestConfig,
@@ -385,15 +458,27 @@ impl ModelCatalog {
     /// callers clamp `max_output_tokens` or drop unsupported temperature /
     /// reasoning knobs *before* [`Self::resolve`], instead of recovering
     /// from `InvalidRequest` errors after the fact.
-    pub async fn capabilities(
-        &self,
-        model: &str,
-    ) -> Result<ModelCapabilities, ModelCatalogError> {
+    pub async fn capabilities(&self, model: &str) -> Result<ModelCapabilities, ModelCatalogError> {
         let snapshot = self.snapshot.read().await;
-        let requested = model.trim().to_ascii_lowercase();
+        let original = model.trim();
+        let requested = original.to_ascii_lowercase();
         match snapshot.models.get(&requested) {
             Some(model) => Ok(model.clone()),
-            None => resolve_unique_basename(&snapshot.models, &requested),
+            None => match resolve_unique_basename(&snapshot.models, &requested) {
+                Ok(model) => Ok(model),
+                Err(ModelCatalogError::ModelNotFound { suggestions, .. }) => {
+                    warn!(
+                        model = %original,
+                        suggestions = %suggestions,
+                        context_limit = DEFAULT_CONTEXT_LIMIT,
+                        output_limit = DEFAULT_OUTPUT_LIMIT,
+                        "model absent from models.dev[{}]; resolving with conservative defaults (limits_source=default)",
+                        PROVIDER
+                    );
+                    Ok(default_capabilities(original.to_owned()))
+                }
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -506,24 +591,13 @@ fn validate_request(
         model: capabilities.id.clone(),
         message,
     };
-    if capabilities.status.as_deref() == Some("deprecated") {
-        return Err(ModelCatalogError::DeprecatedModel {
-            model: capabilities.id.clone(),
-        });
-    }
+    // Structural invariants — enforced for every capability source, including
+    // [`LimitsSource::Default`]: these describe well-formed requests, not
+    // model capabilities.
     if request.max_output_tokens == 0 {
         return Err(invalid(
             "max_output_tokens must be greater than zero".into(),
         ));
-    }
-    if request.max_output_tokens > capabilities.limits.output {
-        return Err(invalid(format!(
-            "max_output_tokens {} exceeds models.dev output limit {}",
-            request.max_output_tokens, capabilities.limits.output
-        )));
-    }
-    if request.temperature.is_some() && !capabilities.temperature {
-        return Err(invalid("temperature is not supported".into()));
     }
     if request.reasoning.effort.is_some() && request.reasoning.budget_tokens.is_some() {
         return Err(invalid(
@@ -536,9 +610,6 @@ fn validate_request(
         return Err(invalid(
             "reasoning.mode must be enabled when effort or budget_tokens is set".into(),
         ));
-    }
-    if !capabilities.reasoning && !matches!(request.reasoning.mode, ReasoningMode::Default) {
-        return Err(invalid("reasoning is not supported".into()));
     }
     if matches!(request.reasoning.mode, ReasoningMode::Disabled) {
         if request.reasoning.budget_tokens.is_some() {
@@ -567,6 +638,44 @@ fn validate_request(
         return Err(invalid(
             "reasoning.effort `none` conflicts with reasoning.mode `enabled`".into(),
         ));
+    }
+
+    // Wire-protocol constraints — enforced for every capability source: they
+    // describe the protocol, not the model.
+    if matches!(wire_protocol, WireProtocol::OpenAiResponses)
+        && request.reasoning.budget_tokens.is_some()
+    {
+        return Err(invalid(
+            "openai_responses cannot express reasoning budget_tokens".into(),
+        ));
+    }
+
+    // Capability assertions — only when the catalog actually knows this model.
+    // Under [`LimitsSource::Default`] the capabilities are a conservative
+    // guess; asserting against them would let the guess veto the session
+    // manager's declaration (e.g. a real 65K output cap rejected by our 32K
+    // guess). The provider is the final authority for such models: an
+    // over-declared limit surfaces as an explicit provider error at turn time.
+    if capabilities.limits_source != LimitsSource::Catalog {
+        return Ok(());
+    }
+
+    if capabilities.status.as_deref() == Some("deprecated") {
+        return Err(ModelCatalogError::DeprecatedModel {
+            model: capabilities.id.clone(),
+        });
+    }
+    if request.max_output_tokens > capabilities.limits.output {
+        return Err(invalid(format!(
+            "max_output_tokens {} exceeds models.dev output limit {}",
+            request.max_output_tokens, capabilities.limits.output
+        )));
+    }
+    if request.temperature.is_some() && !capabilities.temperature {
+        return Err(invalid("temperature is not supported".into()));
+    }
+    if !capabilities.reasoning && !matches!(request.reasoning.mode, ReasoningMode::Default) {
+        return Err(invalid("reasoning is not supported".into()));
     }
 
     let effort_values = capabilities
@@ -635,20 +744,14 @@ fn validate_request(
         _ => {}
     }
 
-    if matches!(wire_protocol, WireProtocol::OpenAiResponses) {
-        if request.reasoning.budget_tokens.is_some() {
-            return Err(invalid(
-                "openai_responses cannot express reasoning budget_tokens".into(),
-            ));
-        }
-        if !matches!(request.reasoning.mode, ReasoningMode::Default)
-            && request.reasoning.effort.is_none()
-            && !supports_none(effort_values)
-        {
-            return Err(invalid(
-                "openai_responses requires an effort-based reasoning control".into(),
-            ));
-        }
+    if matches!(wire_protocol, WireProtocol::OpenAiResponses)
+        && !matches!(request.reasoning.mode, ReasoningMode::Default)
+        && request.reasoning.effort.is_none()
+        && !supports_none(effort_values)
+    {
+        return Err(invalid(
+            "openai_responses requires an effort-based reasoning control".into(),
+        ));
     }
     Ok(())
 }
@@ -812,11 +915,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.model, "deepseek-v4-pro");
-        let error = catalog(FIXTURE)
+        // A contains-only match is NOT a catalog resolution: it falls through
+        // to the conservative defaults, clearly marked, instead of resolving
+        // to the wrong model or failing the session.
+        let resolved = catalog(FIXTURE)
             .resolve(request("deepseek-v4"), WireProtocol::OpenAiCompatible)
             .await
-            .unwrap_err();
-        assert!(matches!(error, ModelCatalogError::ModelNotFound { .. }));
+            .unwrap();
+        assert_eq!(resolved.model, "deepseek-v4");
+        assert_eq!(resolved.capabilities.limits_source, LimitsSource::Default);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_resolves_with_conservative_defaults() {
+        let resolved = catalog(FIXTURE)
+            .resolve(request("glm-5.1-rdclaw"), WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        // The id is echoed back trimmed but NOT lower-cased: it is the wire
+        // model name sent to the provider, and gateway-local ids may be
+        // case-sensitive.
+        assert_eq!(resolved.model, "glm-5.1-rdclaw");
+        assert_eq!(resolved.capabilities.limits_source, LimitsSource::Default);
+        assert_eq!(resolved.capabilities.limits.context, DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(resolved.capabilities.limits.output, DEFAULT_OUTPUT_LIMIT);
+        assert_eq!(resolved.capabilities.limits.input, None);
+        assert!(!resolved.capabilities.reasoning);
+        assert!(resolved.capabilities.temperature);
+        assert!(resolved.capabilities.tool_call);
+        assert_eq!(resolved.capabilities.status, None);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_keeps_original_case() {
+        let resolved = catalog(FIXTURE)
+            .resolve(request("My-Glm-5.1"), WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        assert_eq!(resolved.model, "My-Glm-5.1");
+        assert_eq!(resolved.capabilities.limits_source, LimitsSource::Default);
+    }
+
+    #[tokio::test]
+    async fn default_source_never_vetoes_a_declared_request() {
+        // SM-declared 65K output must not be rejected by our 32K guess.
+        let resolved = catalog(FIXTURE)
+            .resolve(request("glm-5.1-rdclaw"), WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        assert_eq!(resolved.max_output_tokens, 65_536);
+
+        // Explicitly enabled reasoning passes; the provider decides.
+        let mut req = request("glm-5.1-rdclaw");
+        req.reasoning = ReasoningConfig {
+            mode: ReasoningMode::Enabled,
+            effort: Some("high".into()),
+            budget_tokens: None,
+        };
+        catalog(FIXTURE)
+            .resolve(req, WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_source_still_enforces_structural_invariants() {
+        let mut req = request("glm-5.1-rdclaw");
+        req.max_output_tokens = 0;
+        assert!(matches!(
+            catalog(FIXTURE)
+                .resolve(req, WireProtocol::OpenAiCompatible)
+                .await
+                .unwrap_err(),
+            ModelCatalogError::InvalidRequest { .. }
+        ));
+
+        let mut req = request("glm-5.1-rdclaw");
+        req.reasoning = ReasoningConfig {
+            mode: ReasoningMode::Enabled,
+            effort: Some("high".into()),
+            budget_tokens: Some(1_000),
+        };
+        assert!(matches!(
+            catalog(FIXTURE)
+                .resolve(req, WireProtocol::OpenAiCompatible)
+                .await
+                .unwrap_err(),
+            ModelCatalogError::InvalidRequest { .. }
+        ));
+
+        // Wire-protocol constraints still apply to unknown models too.
+        let mut req = request("glm-5.1-rdclaw");
+        req.reasoning = ReasoningConfig {
+            mode: ReasoningMode::Enabled,
+            effort: None,
+            budget_tokens: Some(1_000),
+        };
+        assert!(matches!(
+            catalog(FIXTURE)
+                .resolve(req, WireProtocol::OpenAiResponses)
+                .await
+                .unwrap_err(),
+            ModelCatalogError::InvalidRequest { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_hit_still_marks_catalog_source() {
+        let resolved = catalog(FIXTURE)
+            .resolve(request("deepseek-v4-pro"), WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        assert_eq!(resolved.capabilities.limits_source, LimitsSource::Catalog);
+        // And catalog-source requests are still capped by the real limit.
+        let mut req = request("gpt-5.5");
+        req.max_output_tokens = u64::MAX;
+        assert!(matches!(
+            catalog(FIXTURE)
+                .resolve(req, WireProtocol::OpenAiCompatible)
+                .await
+                .unwrap_err(),
+            ModelCatalogError::InvalidRequest { .. }
+        ));
     }
 
     #[tokio::test]
@@ -829,10 +1049,11 @@ mod tests {
         // is a request-validation concern, not a lookup one.
         let caps = source.capabilities("old-model").await.unwrap();
         assert_eq!(caps.status.as_deref(), Some("deprecated"));
-        assert!(matches!(
-            source.capabilities("missing-model").await.unwrap_err(),
-            ModelCatalogError::ModelNotFound { .. }
-        ));
+        // Unknown ids no longer error at the lookup layer: they resolve to
+        // conservative defaults, marked as such.
+        let caps = source.capabilities("missing-model").await.unwrap();
+        assert_eq!(caps.limits_source, LimitsSource::Default);
+        assert_eq!(caps.id, "missing-model");
     }
 
     #[test]
@@ -1017,13 +1238,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // ...and the broken one is a clean per-model miss, not a catalog failure.
+        // ...and the broken one is a clean per-model miss that resolves to
+        // the conservative defaults, not a catalog failure.
         let mut broken = request("broken");
         broken.max_output_tokens = 100;
-        assert!(matches!(
-            source.resolve(broken, WireProtocol::OpenAiCompatible).await,
-            Err(ModelCatalogError::ModelNotFound { .. })
-        ));
+        let resolved = source
+            .resolve(broken, WireProtocol::OpenAiCompatible)
+            .await
+            .unwrap();
+        assert_eq!(resolved.capabilities.limits_source, LimitsSource::Default);
     }
 
     #[test]

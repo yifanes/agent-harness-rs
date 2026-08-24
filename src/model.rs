@@ -2882,7 +2882,9 @@ impl OpenAiResponsesStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_catalog::{ModelCapabilities, ModelLimits, ReasoningConfig, ReasoningOption};
+    use crate::model_catalog::{
+        LimitsSource, ModelCapabilities, ModelLimits, ReasoningConfig, ReasoningOption,
+    };
 
     fn resolved_model(
         id: &str,
@@ -2915,6 +2917,7 @@ mod tests {
                 tool_call: true,
                 interleaved: None,
                 status: None,
+                limits_source: LimitsSource::Catalog,
             },
         }
     }

@@ -4,6 +4,38 @@ All notable changes to this crate must be documented in this file before each
 release. The project uses patch-only version bumps within the current minor
 line.
 
+## [0.2.16] - 2026-08-24
+
+### Changed
+
+- **Unknown model ids no longer fail closed.** `ModelCatalog::capabilities` /
+  `resolve` now resolve model ids absent from `models.dev["opencode"]` (renamed
+  or gateway-local ids, e.g. `glm-5.1-rdclaw`) against conservative built-in
+  defaults instead of returning `ModelCatalogError::ModelNotFound`:
+  `context = 128_000` (`DEFAULT_CONTEXT_LIMIT`), `output = 32_768`
+  (`DEFAULT_OUTPUT_LIMIT`), `temperature = true`, `reasoning = false`,
+  `tool_call = true`. The resolved capabilities carry the new
+  `ModelCapabilities.limits_source` marker (`LimitsSource::Catalog` |
+  `LimitsSource::Default`); hosts must surface `Default` explicitly (log /
+  status event) instead of treating the limits as verified model facts. The
+  requested id is echoed back trimmed but not lower-cased, since it is the
+  wire model name sent to the provider.
+- **Validation split by capability source.** `validate_request` now enforces
+  structural invariants (`max_output_tokens > 0`, effort/budget mutual
+  exclusion, mode/effort consistency) and wire-protocol constraints (e.g.
+  `openai_responses` cannot express `budget_tokens`) for every source, but
+  capability assertions — output cap, temperature/reasoning support,
+  deprecation, effort-value/budget-range, mode gating — only run when
+  `limits_source == Catalog`. A conservative guess can therefore never veto a
+  session-manager-declared request; the provider stays the final authority
+  for unknown models (over-declared limits surface as an explicit provider
+  error at turn time).
+
+### Compatibility
+
+- `ModelCatalogError::ModelNotFound` is retained but no longer produced by
+  `resolve`; match arms on it remain valid.
+
 ## [0.2.14] - 2026-08-18
 
 ### Added
