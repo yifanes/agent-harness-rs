@@ -1,6 +1,6 @@
 [package]
 name = "agent-harness-rs"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2021"
 authors = ["yifanes"]
 license = "MIT"
